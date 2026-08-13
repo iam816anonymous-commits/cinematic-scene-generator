@@ -424,6 +424,10 @@ class TestDisocclusionAndClamping(unittest.TestCase):
         self.assertTrue(rendered_cin.background_lateral_displacement > 0.0)
         self.assertTrue(rendered_cin.foreground_lateral_displacement > 0.0)
 
+        # Verify screen-space pixel displacements and disparities
+        self.assertTrue(rendered_cin.screen_space_foreground_disp_px > 0.0)
+        self.assertTrue(rendered_cin.screen_space_max_disparity_px > 0.0)
+
         # Verify that reconstructed ratio remains within limits
         self.assertTrue(rendered_cin.reconstruction_ratio < 0.25)
 
