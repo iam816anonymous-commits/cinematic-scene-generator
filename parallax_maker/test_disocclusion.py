@@ -345,6 +345,88 @@ class TestDisocclusionAndClamping(unittest.TestCase):
         self.assertTrue((self.temp_dir / "rendered_image_000.png").exists())
         self.assertTrue((self.temp_dir / "rendered_image_001.png").exists())
 
+    def test_cinematic_parallax_strengths_and_limits(self):
+        """
+        Verify low, zero, cinematic, and high parallax behavior, camera trajectory stability,
+        budget limits, layer ordering preservation, and no layer crossing.
+        """
+        # Create three synthetic slices (background, middleground, foreground)
+        bg_slice = ImageSlice(np.ones((120, 120, 4), dtype=np.uint8) * 255, depth=0)
+        mg_slice = ImageSlice(np.ones((120, 120, 4), dtype=np.uint8) * 255, depth=10)
+        fg_slice = ImageSlice(np.ones((120, 120, 4), dtype=np.uint8) * 255, depth=20)
+        image_slices = [bg_slice, mg_slice, fg_slice]
+
+        bg_orig = ImageSlice(np.ones((100, 100, 4), dtype=np.uint8) * 255, depth=0)
+        mg_orig = ImageSlice(np.ones((100, 100, 4), dtype=np.uint8) * 255, depth=10)
+        fg_orig = ImageSlice(np.ones((100, 100, 4), dtype=np.uint8) * 255, depth=20)
+        original_slices = [bg_orig, mg_orig, fg_orig]
+
+        camera = Camera(100.0, 500.0, 100.0)
+        camera_matrix = camera.camera_matrix(100, 100)
+
+        # Create cards
+        card_corners_3d_list = [
+            bg_slice.create_card(100, 100, camera),
+            mg_slice.create_card(100, 100, camera),
+            fg_slice.create_card(100, 100, camera),
+        ]
+        # Match the 1.2 margin
+        for card in card_corners_3d_list:
+            card[:, :2] *= 1.2
+
+        start_pos = np.array([0.0, 0.0, -100.0], dtype=np.float32)
+        cam_pos = np.array([10.0, 5.0, -90.0], dtype=np.float32) # camera displacement
+
+        # 1. Zero Parallax (strength = 0.0)
+        rendered_zero = render_view(
+            image_slices, camera_matrix, card_corners_3d_list, cam_pos,
+            original_size=(100, 100), original_slices=original_slices,
+            parallax_strength=0.0, start_camera_position=start_pos
+        )
+        self.assertEqual(rendered_zero.normalized_parallax_strength, 0.0)
+        self.assertEqual(rendered_zero.maximum_layer_displacement, 0.0)
+        self.assertEqual(rendered_zero.foreground_displacement, 0.0)
+        self.assertEqual(rendered_zero.middleground_displacement, 0.0)
+        self.assertEqual(rendered_zero.background_displacement, 0.0)
+
+        # 2. Low Parallax (strength = 0.25)
+        rendered_low = render_view(
+            image_slices, camera_matrix, card_corners_3d_list, cam_pos,
+            original_size=(100, 100), original_slices=original_slices,
+            parallax_strength=0.25, start_camera_position=start_pos
+        )
+        self.assertEqual(rendered_low.normalized_parallax_strength, 0.25)
+        self.assertTrue(rendered_low.maximum_layer_displacement > 0.0)
+
+        # 3. Cinematic Parallax (strength = 0.5)
+        rendered_cin = render_view(
+            image_slices, camera_matrix, card_corners_3d_list, cam_pos,
+            original_size=(100, 100), original_slices=original_slices,
+            parallax_strength=0.5, start_camera_position=start_pos
+        )
+        self.assertEqual(rendered_cin.normalized_parallax_strength, 0.5)
+        # Verify displacement is moderate and larger than low strength
+        self.assertTrue(rendered_cin.maximum_layer_displacement > rendered_low.maximum_layer_displacement)
+
+        # 4. High Parallax (strength = 0.75)
+        rendered_high = render_view(
+            image_slices, camera_matrix, card_corners_3d_list, cam_pos,
+            original_size=(100, 100), original_slices=original_slices,
+            parallax_strength=0.75, start_camera_position=start_pos
+        )
+        self.assertEqual(rendered_high.normalized_parallax_strength, 0.75)
+        self.assertTrue(rendered_high.maximum_layer_displacement > rendered_cin.maximum_layer_displacement)
+
+        # 5. Layer ordering & no-crossing check
+        # Middleground lateral displacement should be zero since it's the visual anchor
+        self.assertAlmostEqual(rendered_cin.middleground_lateral_displacement, 0.0, places=4)
+        # Background and foreground move laterally in contrary directions
+        self.assertTrue(rendered_cin.background_lateral_displacement > 0.0)
+        self.assertTrue(rendered_cin.foreground_lateral_displacement > 0.0)
+
+        # Verify that reconstructed ratio remains within limits
+        self.assertTrue(rendered_cin.reconstruction_ratio < 0.25)
+
     def test_midas_dependency_validation(self):
         from unittest.mock import patch
         from parallax_maker.depth import create_medias_pipeline

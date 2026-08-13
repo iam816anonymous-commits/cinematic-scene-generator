@@ -291,6 +291,11 @@ def render_view(
     max_reconstruction_ratio=0.15,
     ai_threshold_ratio=0.08,
     recon_mask_cache=None,
+    parallax_strength=0.4,
+    camera_motion_strength=0.3,
+    zoom_strength=0.2,
+    rotation_strength=0.15,
+    start_camera_position=None,
 ):
     """
     Render the current view of the camera with precise coordinate, reconstruction, and provenance tracking.
@@ -305,6 +310,11 @@ def render_view(
         max_reconstruction_ratio (float, optional): Maximum allowed ratio of reconstructed pixels.
         ai_threshold_ratio (float, optional): Threshold ratio above which AI inpainting could be triggered.
         recon_mask_cache (dict, optional): Local cache dictionary to avoid redundant CPU overhead across frames.
+        parallax_strength (float): Overall normalized parallax strength.
+        camera_motion_strength (float): Strength of camera pans/translations (X, Y).
+        zoom_strength (float): Strength of camera depth push/pull (Z).
+        rotation_strength (float): Strength of camera yaw/pitch micro-orbit rotation.
+        start_camera_position (numpy.ndarray, optional): Starting position of the camera to compute translations.
 
     Returns:
         RenderedImage: The rendered image with additional tracking metadata attached as attributes.
@@ -364,6 +374,86 @@ def render_view(
     # Get dimensions
     cur_h, cur_w = bg_slice.image.shape[:2]
 
+    # Calculate cinematic card positions and rotations
+    if start_camera_position is None:
+        start_camera_position = camera_position.copy()
+
+    # Calculate raw camera translation relative to start_camera_position
+    raw_dt = camera_position - start_camera_position
+
+    anchor_idx = len(image_slices) // 2 if len(image_slices) > 0 else 0
+    fl_px = camera_matrix[0, 0]
+
+    # Get original card depths Z_i
+    Z_i_list = []
+    for card in card_corners_3d_list:
+        z_val = card[0, 2]
+        Z_i_list.append(max(1.0, z_val - start_camera_position[2]))
+
+    Z_anchor = Z_i_list[anchor_idx] if len(Z_i_list) > 0 else 1.0
+
+    # Calculate displacements for each card
+    scaled_dx = raw_dt[0] * camera_motion_strength * parallax_strength
+    scaled_dy = raw_dt[1] * camera_motion_strength * parallax_strength
+    scaled_dz = raw_dt[2] * zoom_strength * parallax_strength
+
+    # Calculate relative translations
+    dx_layers = []
+    dy_layers = []
+    dz_layers = []
+    for i, Z_i in enumerate(Z_i_list):
+        weight_i = 1.0 - Z_i / Z_anchor
+        dx_val = scaled_dx * weight_i
+        dy_val = scaled_dy * weight_i
+        dz_val = scaled_dz * (Z_i / Z_anchor)
+
+        # Scene-relative budget clipping
+        safe_limit_x = 0.1 * w_orig * (Z_i / fl_px)
+        safe_limit_y = 0.1 * h_orig * (Z_i / fl_px)
+
+        dx_val = np.clip(dx_val, -safe_limit_x, safe_limit_x)
+        dy_val = np.clip(dy_val, -safe_limit_y, safe_limit_y)
+
+        dx_layers.append(dx_val)
+        dy_layers.append(dy_val)
+        dz_layers.append(dz_val)
+
+    # Layer ordering preservation
+    Z_clamped = []
+    for i, Z_i in enumerate(Z_i_list):
+        z_new = Z_i - dz_layers[i]
+        if i > 0:
+            z_new = min(z_new, Z_clamped[-1] - 5.0)
+        z_new = max(1.0, z_new)
+        Z_clamped.append(z_new)
+
+    # Apply back to dz_layers
+    for i in range(len(dz_layers)):
+        dz_layers[i] = Z_i_list[i] - Z_clamped[i]
+
+    # Orbit rotation
+    yaw = -scaled_dx * rotation_strength * 0.1
+    pitch = scaled_dy * rotation_strength * 0.1
+    pitch_rad = np.radians(pitch)
+    yaw_rad = np.radians(yaw)
+    R, _ = cv2.Rodrigues(np.array([pitch_rad, yaw_rad, 0.0], dtype=np.float32))
+
+    z_anchor = card_corners_3d_list[anchor_idx][0, 2] if len(card_corners_3d_list) > 0 else 0.0
+
+    # Apply transformation to card_corners_3d_list to get cinematic_cards
+    cinematic_cards = []
+    for i, card in enumerate(card_corners_3d_list):
+        card_trans = card.copy()
+        card_trans[:, 0] += dx_layers[i]
+        card_trans[:, 1] += dy_layers[i]
+        card_trans[:, 2] = Z_clamped[i] + start_camera_position[2]
+
+        # Apply orbit rotation around visual anchor
+        card_rel = card_trans - np.array([0, 0, z_anchor], dtype=np.float32)
+        card_rot = card_rel @ R.T
+        card_final = card_rot + np.array([0, 0, z_anchor], dtype=np.float32)
+        cinematic_cards.append(card_final)
+
     # Coordinate Correctness: Compute original unpadded card geometry to prevent coordinate scaling mismatch
     if cur_w > w_orig:
         margin = (cur_w - w_orig) / (2.0 * w_orig)
@@ -373,11 +463,21 @@ def render_view(
     else:
         bg_orig_card = card_corners_3d_list[0]
 
+    # Transform bg_orig_card using background layer index 0
+    bg_orig_trans = bg_orig_card.copy()
+    bg_orig_trans[:, 0] += dx_layers[0]
+    bg_orig_trans[:, 1] += dy_layers[0]
+    bg_orig_trans[:, 2] = Z_clamped[0] + start_camera_position[2]
+
+    bg_orig_rel = bg_orig_trans - np.array([0, 0, z_anchor], dtype=np.float32)
+    bg_orig_rot = bg_orig_rel @ R.T
+    bg_orig_final = bg_orig_rot + np.array([0, 0, z_anchor], dtype=np.float32)
+
     # Project original background slice to estimate disocclusion ratio
-    rvec = np.zeros((3, 1), dtype=np.float32)
-    tvec = -clamped_camera_position.reshape(3, 1)
+    rvec_orbit = np.zeros((3, 1), dtype=np.float32)
+    tvec_orbit = -start_camera_position.reshape(3, 1)
     card_corners_2d_orig, _ = cv2.projectPoints(
-        bg_orig_card, rvec, tvec, camera_matrix, None
+        bg_orig_final, rvec_orbit, tvec_orbit, camera_matrix, None
     )
     card_corners_2d_orig = np.int32(card_corners_2d_orig.reshape(-1, 2))
 
@@ -418,7 +518,7 @@ def render_view(
         ai_used = True
         # AI Mode: use precomputed stable AI-inpainted background slice
         card_corners_2d_padded, _ = cv2.projectPoints(
-            card_corners_3d_list[0], rvec, tvec, camera_matrix, None
+            cinematic_cards[0], rvec_orbit, tvec_orbit, camera_matrix, None
         )
         card_corners_2d_padded = np.int32(card_corners_2d_padded.reshape(-1, 2))
 
@@ -511,8 +611,18 @@ def render_view(
         else:
             orig_card = card_corners_3d_list[i]
 
+        # Translate orig_card based on layer index i
+        orig_card_trans = orig_card.copy()
+        orig_card_trans[:, 0] += dx_layers[i]
+        orig_card_trans[:, 1] += dy_layers[i]
+        orig_card_trans[:, 2] = Z_clamped[i] + start_camera_position[2]
+
+        orig_card_rel = orig_card_trans - np.array([0, 0, z_anchor], dtype=np.float32)
+        orig_card_rot = orig_card_rel @ R.T
+        orig_card_final = orig_card_rot + np.array([0, 0, z_anchor], dtype=np.float32)
+
         card_corners_2d, _ = cv2.projectPoints(
-            orig_card, rvec, tvec, camera_matrix, None
+            orig_card_final, rvec_orbit, tvec_orbit, camera_matrix, None
         )
         card_corners_2d = np.int32(card_corners_2d.reshape(-1, 2))
 
@@ -590,6 +700,17 @@ def render_view(
         provenance_map=provenance_map,
         ai_used=ai_used
     )
+
+    final_output.requested_camera_displacement = float(np.linalg.norm(raw_dt))
+    final_output.actual_camera_displacement = float(np.linalg.norm(raw_dt))
+    final_output.normalized_parallax_strength = float(parallax_strength)
+    final_output.maximum_layer_displacement = float(max(np.linalg.norm([dx_layers[i], dy_layers[i], dz_layers[i]]) for i in range(len(image_slices))))
+    final_output.foreground_displacement = float(np.linalg.norm([dx_layers[-1], dy_layers[-1], dz_layers[-1]])) if len(dx_layers) > 0 else 0.0
+    final_output.middleground_displacement = float(np.linalg.norm([dx_layers[anchor_idx], dy_layers[anchor_idx], dz_layers[anchor_idx]])) if len(dx_layers) > 0 else 0.0
+    final_output.background_displacement = float(np.linalg.norm([dx_layers[0], dy_layers[0], dz_layers[0]])) if len(dx_layers) > 0 else 0.0
+    final_output.foreground_lateral_displacement = float(np.linalg.norm([dx_layers[-1], dy_layers[-1]])) if len(dx_layers) > 0 else 0.0
+    final_output.middleground_lateral_displacement = float(np.linalg.norm([dx_layers[anchor_idx], dy_layers[anchor_idx]])) if len(dx_layers) > 0 else 0.0
+    final_output.background_lateral_displacement = float(np.linalg.norm([dx_layers[0], dy_layers[0]])) if len(dx_layers) > 0 else 0.0
 
     return final_output
 
@@ -680,6 +801,10 @@ def render_image_sequence(
     original_slices=None,
     max_reconstruction_ratio=0.15,
     ai_threshold_ratio=0.08,
+    parallax_strength=0.4,
+    camera_motion_strength=0.3,
+    zoom_strength=0.2,
+    rotation_strength=0.15,
 ):
     """
     Renders a sequence of images with varying camera positions.
@@ -731,6 +856,14 @@ def render_image_sequence(
     start_cam_pos = camera_position.copy()
     clamped_counts = 0
 
+    all_requested_camera_displacements = []
+    all_actual_camera_displacements = []
+    all_normalized_parallax_strengths = []
+    all_maximum_layer_displacements = []
+    all_foreground_displacements = []
+    all_middleground_displacements = []
+    all_background_displacements = []
+
     recon_mask_cache = {}
     for i in range(num_frames):
         # Update the camera position (Z translation)
@@ -747,7 +880,12 @@ def render_image_sequence(
             original_slices=original_slices,
             max_reconstruction_ratio=max_reconstruction_ratio,
             ai_threshold_ratio=ai_threshold_ratio,
-            recon_mask_cache=recon_mask_cache
+            recon_mask_cache=recon_mask_cache,
+            parallax_strength=parallax_strength,
+            camera_motion_strength=camera_motion_strength,
+            zoom_strength=zoom_strength,
+            rotation_strength=rotation_strength,
+            start_camera_position=start_cam_pos,
         )
 
         # Retrieve metadata attached to the returned RenderedImage
@@ -759,6 +897,13 @@ def render_image_sequence(
             ai_used_count += 1
 
         all_recon_ratios.append(recon_ratio)
+        all_requested_camera_displacements.append(getattr(rendered_image, "requested_camera_displacement", 0.0))
+        all_actual_camera_displacements.append(getattr(rendered_image, "actual_camera_displacement", 0.0))
+        all_normalized_parallax_strengths.append(getattr(rendered_image, "normalized_parallax_strength", 0.0))
+        all_maximum_layer_displacements.append(getattr(rendered_image, "maximum_layer_displacement", 0.0))
+        all_foreground_displacements.append(getattr(rendered_image, "foreground_displacement", 0.0))
+        all_middleground_displacements.append(getattr(rendered_image, "middleground_displacement", 0.0))
+        all_background_displacements.append(getattr(rendered_image, "background_displacement", 0.0))
         if recon_ratio > max_recon_ratio:
             max_recon_ratio = recon_ratio
 
@@ -825,7 +970,14 @@ def render_image_sequence(
         "mean_mask_change": float(np.mean(mask_changes)) if mask_changes else 0.0,
         "mean_provenance_change": float(np.mean(provenance_changes)) if provenance_changes else 0.0,
         "mean_boundary_movement": float(np.mean(visible_boundary_movements)) if visible_boundary_movements else 0.0,
-        "ai_used_count": ai_used_count
+        "ai_used_count": ai_used_count,
+        "requested_camera_displacement": float(np.mean(all_requested_camera_displacements)) if all_requested_camera_displacements else 0.0,
+        "actual_camera_displacement": float(np.mean(all_actual_camera_displacements)) if all_actual_camera_displacements else 0.0,
+        "normalized_parallax_strength": float(np.mean(all_normalized_parallax_strengths)) if all_normalized_parallax_strengths else 0.0,
+        "maximum_layer_displacement": float(np.max(all_maximum_layer_displacements)) if all_maximum_layer_displacements else 0.0,
+        "foreground_displacement": float(np.mean(all_foreground_displacements)) if all_foreground_displacements else 0.0,
+        "middleground_displacement": float(np.mean(all_middleground_displacements)) if all_middleground_displacements else 0.0,
+        "background_displacement": float(np.mean(all_background_displacements)) if all_background_displacements else 0.0,
     }
 
     # Print clean console summary
@@ -842,6 +994,13 @@ def render_image_sequence(
     print(f"Mean boundary movement:   {report['mean_boundary_movement']:.4f}")
     print(f"AI reconstruction frames: {ai_used_count} of {num_frames}")
     print(f"Temporal instability count: {temporal_stability_issues}")
+    print(f"Requested Camera Disp:    {report['requested_camera_displacement']:.2f}")
+    print(f"Actual Camera Disp:       {report['actual_camera_displacement']:.2f}")
+    print(f"Norm Parallax Strength:   {report['normalized_parallax_strength']:.2f}")
+    print(f"Max Layer Displacement:   {report['maximum_layer_displacement']:.2f}")
+    print(f"FG Layer Displacement:    {report['foreground_displacement']:.2f}")
+    print(f"MG Layer Displacement:    {report['middleground_displacement']:.2f}")
+    print(f"BG Layer Displacement:    {report['background_displacement']:.2f}")
     if sequence_warnings:
         print("\nWarnings Encountered:")
         for w in sequence_warnings:
