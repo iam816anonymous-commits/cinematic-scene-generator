@@ -296,6 +296,8 @@ def render_view(
     zoom_strength=0.2,
     rotation_strength=0.15,
     start_camera_position=None,
+    perceptual_parallax_strength=0.55,
+    t=0.0,
 ):
     """
     Render the current view of the camera with precise coordinate, reconstruction, and provenance tracking.
@@ -315,6 +317,8 @@ def render_view(
         zoom_strength (float): Strength of camera depth push/pull (Z).
         rotation_strength (float): Strength of camera yaw/pitch micro-orbit rotation.
         start_camera_position (numpy.ndarray, optional): Starting position of the camera to compute translations.
+        perceptual_parallax_strength (float): Bounded cinematic parameter that controls target screen-space disparity.
+        t (float): Normalized progression from 0.0 to 1.0 along the camera trajectory.
 
     Returns:
         RenderedImage: The rendered image with additional tracking metadata attached as attributes.
@@ -381,6 +385,9 @@ def render_view(
     # Calculate raw camera translation relative to start_camera_position
     raw_dt = camera_position - start_camera_position
 
+    # Effective perceptual strength scales with parallax_strength
+    eff_perceptual_strength = perceptual_parallax_strength * parallax_strength
+
     anchor_idx = len(image_slices) // 2 if len(image_slices) > 0 else 0
     fl_px = camera_matrix[0, 0]
 
@@ -392,9 +399,25 @@ def render_view(
 
     Z_anchor = Z_i_list[anchor_idx] if len(Z_i_list) > 0 else 1.0
 
-    # Calculate displacements for each card
-    scaled_dx = raw_dt[0] * camera_motion_strength * parallax_strength
-    scaled_dy = raw_dt[1] * camera_motion_strength * parallax_strength
+    # Calculate the maximum safe shift in pixels based on the 10% safety margin budget
+    max_safe_px_x = 0.1 * w_orig
+    max_safe_px_y = 0.1 * h_orig
+
+    # Setup the target screen-space lateral pixel shifts.
+    # If the trajectory lacks horizontal/vertical motion (e.g. pure Z push), we generate a smooth, professional
+    # lateral sweep (micro-orbit dolly pan) over the sequence to create rich, visible cinematic 3D depth perception.
+    if np.allclose(raw_dt[:2], 0.0, atol=1e-3):
+        # Loopable sine sweep that starts and ends exactly at 0.0 (the pristine original composition)
+        sweep_x = np.sin(np.pi * t)
+        sweep_y = 0.3 * np.sin(2.0 * np.pi * t)
+        pixel_shift_x = max_safe_px_x * eff_perceptual_strength * sweep_x
+        pixel_shift_y = max_safe_px_y * eff_perceptual_strength * sweep_y
+    else:
+        # Respect user manual navigation with lateral panning
+        pixel_shift_x = raw_dt[0] * camera_motion_strength * eff_perceptual_strength * 0.5
+        pixel_shift_y = raw_dt[1] * camera_motion_strength * eff_perceptual_strength * 0.5
+
+    # Z push (zoom) displacement
     scaled_dz = raw_dt[2] * zoom_strength * parallax_strength
 
     # Calculate relative translations
@@ -402,14 +425,21 @@ def render_view(
     dy_layers = []
     dz_layers = []
     for i, Z_i in enumerate(Z_i_list):
+        # Asymmetric, depth-normalized disparity weights
         weight_i = 1.0 - Z_i / Z_anchor
-        dx_val = scaled_dx * weight_i
-        dy_val = scaled_dy * weight_i
+
+        # Determine actual screen shifts
+        shift_px_x = pixel_shift_x * weight_i
+        shift_px_y = pixel_shift_y * weight_i
+
+        # Convert target screen-space pixel shifts directly to physical world translations
+        dx_val = shift_px_x * (Z_i / fl_px)
+        dy_val = shift_px_y * (Z_i / fl_px)
         dz_val = scaled_dz * (Z_i / Z_anchor)
 
         # Scene-relative budget clipping
-        safe_limit_x = 0.1 * w_orig * (Z_i / fl_px)
-        safe_limit_y = 0.1 * h_orig * (Z_i / fl_px)
+        safe_limit_x = max_safe_px_x * (Z_i / fl_px)
+        safe_limit_y = max_safe_px_y * (Z_i / fl_px)
 
         dx_val = np.clip(dx_val, -safe_limit_x, safe_limit_x)
         dy_val = np.clip(dy_val, -safe_limit_y, safe_limit_y)
@@ -431,9 +461,9 @@ def render_view(
     for i in range(len(dz_layers)):
         dz_layers[i] = Z_i_list[i] - Z_clamped[i]
 
-    # Orbit rotation
-    yaw = -scaled_dx * rotation_strength * 0.1
-    pitch = scaled_dy * rotation_strength * 0.1
+    # Orbit rotation around visual anchor
+    yaw = -pixel_shift_x * 0.1 * rotation_strength
+    pitch = pixel_shift_y * 0.1 * rotation_strength
     pitch_rad = np.radians(pitch)
     yaw_rad = np.radians(yaw)
     R, _ = cv2.Rodrigues(np.array([pitch_rad, yaw_rad, 0.0], dtype=np.float32))
@@ -712,6 +742,40 @@ def render_view(
     final_output.middleground_lateral_displacement = float(np.linalg.norm([dx_layers[anchor_idx], dy_layers[anchor_idx]])) if len(dx_layers) > 0 else 0.0
     final_output.background_lateral_displacement = float(np.linalg.norm([dx_layers[0], dy_layers[0]])) if len(dx_layers) > 0 else 0.0
 
+    # Compute actual screen-space displacements in pixels
+    r_zero = np.zeros((3, 1), dtype=np.float32)
+    t_zero = -start_camera_position.reshape(3, 1)
+
+    # original projection (no translation/orbit)
+    corners_2d_orig_list = []
+    for card in card_corners_3d_list:
+        proj_orig, _ = cv2.projectPoints(card, r_zero, t_zero, camera_matrix, None)
+        corners_2d_orig_list.append(proj_orig.reshape(-1, 2))
+
+    # cinematic projection
+    corners_2d_cin_list = []
+    for c_card in cinematic_cards:
+        proj_cin, _ = cv2.projectPoints(c_card, r_zero, t_zero, camera_matrix, None)
+        corners_2d_cin_list.append(proj_cin.reshape(-1, 2))
+
+    # Calculate screen space pixel displacements
+    disp_layers_px = []
+    for i in range(len(image_slices)):
+        diff = np.linalg.norm(corners_2d_cin_list[i] - corners_2d_orig_list[i], axis=1)
+        disp_layers_px.append(float(diff.mean()))
+
+    # Relative disparity between foreground and background in pixels
+    if len(image_slices) >= 2:
+        disparity_diff = (corners_2d_cin_list[-1] - corners_2d_cin_list[0]) - (corners_2d_orig_list[-1] - corners_2d_orig_list[0])
+        max_disparity_px = float(np.linalg.norm(disparity_diff, axis=1).mean())
+    else:
+        max_disparity_px = 0.0
+
+    final_output.screen_space_foreground_disp_px = disp_layers_px[-1] if len(disp_layers_px) > 0 else 0.0
+    final_output.screen_space_middleground_disp_px = disp_layers_px[anchor_idx] if len(disp_layers_px) > 0 else 0.0
+    final_output.screen_space_background_disp_px = disp_layers_px[0] if len(disp_layers_px) > 0 else 0.0
+    final_output.screen_space_max_disparity_px = max_disparity_px
+
     return final_output
 
 
@@ -805,6 +869,7 @@ def render_image_sequence(
     camera_motion_strength=0.3,
     zoom_strength=0.2,
     rotation_strength=0.15,
+    perceptual_parallax_strength=0.55,
 ):
     """
     Renders a sequence of images with varying camera positions.
@@ -863,12 +928,19 @@ def render_image_sequence(
     all_foreground_displacements = []
     all_middleground_displacements = []
     all_background_displacements = []
+    all_screen_space_foreground_disp_px = []
+    all_screen_space_middleground_disp_px = []
+    all_screen_space_background_disp_px = []
+    all_screen_space_max_disparity_px = []
 
     recon_mask_cache = {}
     for i in range(num_frames):
         # Update the camera position (Z translation)
         requested_pos = start_cam_pos.copy()
         requested_pos[2] += (float(push_distance) / num_frames) * i
+
+        # Calculate progression t
+        t_val = float(i) / (num_frames - 1) if num_frames > 1 else 0.0
 
         # Render the view
         rendered_image = render_view(
@@ -886,6 +958,8 @@ def render_image_sequence(
             zoom_strength=zoom_strength,
             rotation_strength=rotation_strength,
             start_camera_position=start_cam_pos,
+            perceptual_parallax_strength=perceptual_parallax_strength,
+            t=t_val,
         )
 
         # Retrieve metadata attached to the returned RenderedImage
@@ -904,6 +978,10 @@ def render_image_sequence(
         all_foreground_displacements.append(getattr(rendered_image, "foreground_displacement", 0.0))
         all_middleground_displacements.append(getattr(rendered_image, "middleground_displacement", 0.0))
         all_background_displacements.append(getattr(rendered_image, "background_displacement", 0.0))
+        all_screen_space_foreground_disp_px.append(getattr(rendered_image, "screen_space_foreground_disp_px", 0.0))
+        all_screen_space_middleground_disp_px.append(getattr(rendered_image, "screen_space_middleground_disp_px", 0.0))
+        all_screen_space_background_disp_px.append(getattr(rendered_image, "screen_space_background_disp_px", 0.0))
+        all_screen_space_max_disparity_px.append(getattr(rendered_image, "screen_space_max_disparity_px", 0.0))
         if recon_ratio > max_recon_ratio:
             max_recon_ratio = recon_ratio
 
@@ -978,6 +1056,10 @@ def render_image_sequence(
         "foreground_displacement": float(np.mean(all_foreground_displacements)) if all_foreground_displacements else 0.0,
         "middleground_displacement": float(np.mean(all_middleground_displacements)) if all_middleground_displacements else 0.0,
         "background_displacement": float(np.mean(all_background_displacements)) if all_background_displacements else 0.0,
+        "screen_space_foreground_disp_px": float(np.mean(all_screen_space_foreground_disp_px)) if all_screen_space_foreground_disp_px else 0.0,
+        "screen_space_middleground_disp_px": float(np.mean(all_screen_space_middleground_disp_px)) if all_screen_space_middleground_disp_px else 0.0,
+        "screen_space_background_disp_px": float(np.mean(all_screen_space_background_disp_px)) if all_screen_space_background_disp_px else 0.0,
+        "screen_space_max_disparity_px": float(np.max(all_screen_space_max_disparity_px)) if all_screen_space_max_disparity_px else 0.0,
     }
 
     # Print clean console summary
@@ -1001,6 +1083,10 @@ def render_image_sequence(
     print(f"FG Layer Displacement:    {report['foreground_displacement']:.2f}")
     print(f"MG Layer Displacement:    {report['middleground_displacement']:.2f}")
     print(f"BG Layer Displacement:    {report['background_displacement']:.2f}")
+    print(f"FG Screen Disp (pixels):  {report['screen_space_foreground_disp_px']:.2f}")
+    print(f"MG Screen Disp (pixels):  {report['screen_space_middleground_disp_px']:.2f}")
+    print(f"BG Screen Disp (pixels):  {report['screen_space_background_disp_px']:.2f}")
+    print(f"Max Relative Disparity (px): {report['screen_space_max_disparity_px']:.2f}")
     if sequence_warnings:
         print("\nWarnings Encountered:")
         for w in sequence_warnings:
