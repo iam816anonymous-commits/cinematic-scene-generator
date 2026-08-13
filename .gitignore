@@ -160,3 +160,6 @@ package-lock.json
 
 # Parallax Maker
 appstate-*/
+rendered_output_300/
+run_300_frame_test.py
+run_ab_benchmark.py

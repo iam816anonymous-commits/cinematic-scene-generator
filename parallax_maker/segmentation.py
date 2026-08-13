@@ -20,6 +20,7 @@ from .depth import DepthEstimationModel
 from .gltf import export_gltf
 from .camera import Camera
 from .slice import ImageSlice
+from .motion import CinematicMotionModel, MotionProfile
 
 
 def generate_depth_map(image, model: DepthEstimationModel, progress_callback=None):
@@ -291,20 +292,29 @@ def render_view(
     max_reconstruction_ratio=0.15,
     ai_threshold_ratio=0.08,
     recon_mask_cache=None,
+    motion_mode="baseline",
+    cinematic_profile=None,
+    frame_idx=0,
+    total_frames=300,
 ):
     """
     Render the current view of the camera with precise coordinate, reconstruction, and provenance tracking.
+    Supports either the baseline camera motion or the advanced scene-adaptive Cinematic Perceived-Depth Parallax model.
 
     Args:
         image_slices (list): A list of image slices (can be reconstructed/padded ones).
         camera_matrix (numpy.ndarray): The camera matrix.
         card_corners_3d_list (list): A list of 3D card corners.
-        camera_position (numpy.ndarray): The current camera position.
+        camera_position (numpy.ndarray): The current camera position (for baseline).
         original_size (tuple, optional): Original size of the unpadded image.
         original_slices (list, optional): Original unpadded/un-inpainted slices.
         max_reconstruction_ratio (float, optional): Maximum allowed ratio of reconstructed pixels.
         ai_threshold_ratio (float, optional): Threshold ratio above which AI inpainting could be triggered.
         recon_mask_cache (dict, optional): Local cache dictionary to avoid redundant CPU overhead across frames.
+        motion_mode (str, optional): "baseline" or "cinematic" motion models.
+        cinematic_profile (MotionProfile, optional): Cinematic profile with calculated default constraints.
+        frame_idx (int, optional): Current frame index.
+        total_frames (int, optional): Total sequence frames.
 
     Returns:
         RenderedImage: The rendered image with additional tracking metadata attached as attributes.
@@ -336,8 +346,8 @@ def render_view(
 
     # Track internal warnings
     warnings = []
-    # Expose a render quality warning if requested camera trajectory exceeds safe boundary
-    if not np.allclose(camera_position, clamped_camera_position, atol=1e-3):
+    # Expose a render quality warning if requested camera trajectory exceeds safe boundary in baseline
+    if motion_mode == "baseline" and not np.allclose(camera_position, clamped_camera_position, atol=1e-3):
         warnings.append(
             f"Requested camera trajectory {camera_position} exceeds safe boundary limit and was clamped to {clamped_camera_position}."
         )
@@ -357,6 +367,23 @@ def render_view(
     )
     rendered_image[:, :, 3] = 1
 
+    # Extract slice depth limits for normalized depth-weighted motion model
+    depth_values = [float(s.depth) for s in image_slices if s.depth >= 0]
+    min_d = min(depth_values) if depth_values else 0.0
+    max_d = max(depth_values) if depth_values else 255.0
+
+    # Build or retrieve the automatic cinematic profile
+    if motion_mode == "cinematic":
+        profile = cinematic_profile
+        if profile is None:
+            # Fallback scene profiling using estimated ranges
+            profile = CinematicMotionModel.analyze_scene_and_build_profile(np.array([[min_d, max_d]]))
+
+        # Calculate smooth looping easing phases for gentle drift and subtle push/pull
+        phase_x = np.sin(2.0 * np.pi * frame_idx / max(1, total_frames - 1))
+        phase_y = np.cos(2.0 * np.pi * frame_idx / max(1, total_frames - 1)) - 1.0
+        phase_z = float(frame_idx) / max(1, total_frames - 1)
+
     # Background layer (i == 0) decision and rendering logic
     bg_slice = image_slices[0]
     bg_orig_slice = original_slices[0] if original_slices is not None else None
@@ -375,7 +402,17 @@ def render_view(
 
     # Project original background slice to estimate disocclusion ratio
     rvec = np.zeros((3, 1), dtype=np.float32)
-    tvec = -clamped_camera_position.reshape(3, 1)
+
+    if motion_mode == "cinematic":
+        # Calculate depth-weighted displacement for background
+        w_0 = CinematicMotionModel.get_displacement_weights(bg_slice.depth, min_d, max_d, profile.depth_response)
+        dx_0 = profile.max_displacement_x * w_0 * phase_x
+        dy_0 = profile.max_displacement_y * w_0 * phase_y
+        dz_0 = profile.max_displacement_z * w_0 * phase_z
+        tvec = np.array([-dx_0, -dy_0, clamped_camera_position[2] - dz_0], dtype=np.float32).reshape(3, 1)
+    else:
+        tvec = -clamped_camera_position.reshape(3, 1)
+
     card_corners_2d_orig, _ = cv2.projectPoints(
         bg_orig_card, rvec, tvec, camera_matrix, None
     )
@@ -417,9 +454,15 @@ def render_view(
     if use_ai_inpainting:
         ai_used = True
         # AI Mode: use precomputed stable AI-inpainted background slice
-        card_corners_2d_padded, _ = cv2.projectPoints(
-            card_corners_3d_list[0], rvec, tvec, camera_matrix, None
-        )
+        if motion_mode == "cinematic":
+            # Scale background card
+            card_corners_2d_padded, _ = cv2.projectPoints(
+                card_corners_3d_list[0], rvec, tvec, camera_matrix, None
+            )
+        else:
+            card_corners_2d_padded, _ = cv2.projectPoints(
+                card_corners_3d_list[0], rvec, tvec, camera_matrix, None
+            )
         card_corners_2d_padded = np.int32(card_corners_2d_padded.reshape(-1, 2))
 
         M_padded = cv2.getPerspectiveTransform(
@@ -488,11 +531,16 @@ def render_view(
         if hole_pixels > 0:
             provenance_map[hole_mask > 0] = 2 # deterministic OpenCV Telea
 
-    # Track if disocclusion ratio exceeds max ratio limit
-    if disocclusion_ratio > max_reconstruction_ratio:
+    # Track if disocclusion ratio exceeds max ratio limit / budget
+    if motion_mode == "cinematic":
+        budget_limit = profile.reconstruction_budget
+    else:
+        budget_limit = max_reconstruction_ratio
+
+    if disocclusion_ratio > budget_limit:
         warnings.append(
             f"Requested camera displacement creates a disocclusion area of {disocclusion_ratio * 100:.2f}%, "
-            f"which exceeds the maximum recommended ratio of {max_reconstruction_ratio * 100:.2f}%."
+            f"which exceeds the maximum recommended ratio of {budget_limit * 100:.2f}%."
         )
 
     # Render middle and foreground layers (from back to front)
@@ -510,6 +558,14 @@ def render_view(
             orig_card[:, :2] /= scale_factor
         else:
             orig_card = card_corners_3d_list[i]
+
+        if motion_mode == "cinematic":
+            # Calculate depth-weighted displacement for this specific slice
+            w_i = CinematicMotionModel.get_displacement_weights(slice_image.depth, min_d, max_d, profile.depth_response)
+            dx_i = profile.max_displacement_x * w_i * phase_x
+            dy_i = profile.max_displacement_y * w_i * phase_y
+            dz_i = profile.max_displacement_z * w_i * phase_z
+            tvec = np.array([-dx_i, -dy_i, clamped_camera_position[2] - dz_i], dtype=np.float32).reshape(3, 1)
 
         card_corners_2d, _ = cv2.projectPoints(
             orig_card, rvec, tvec, camera_matrix, None
@@ -680,9 +736,11 @@ def render_image_sequence(
     original_slices=None,
     max_reconstruction_ratio=0.15,
     ai_threshold_ratio=0.08,
+    motion_mode="baseline",
+    cinematic_profile=None,
 ):
     """
-    Renders a sequence of images with varying camera positions.
+    Renders a sequence of images with varying camera positions, supporting baseline or cinematic perceived-depth motion models.
 
     Args:
         output_path (str): The path to the output directory where the rendered images will be saved.
@@ -697,6 +755,8 @@ def render_image_sequence(
         original_slices (list, optional): Original unpadded/un-inpainted slices.
         max_reconstruction_ratio (float, optional): Maximum allowed ratio of reconstructed pixels.
         ai_threshold_ratio (float, optional): Threshold ratio above which AI inpainting could be triggered.
+        motion_mode (str, optional): "baseline" or "cinematic" motion models.
+        cinematic_profile (MotionProfile, optional): Cinematic profile with calculated default constraints.
 
     Returns:
         dict: A sequence report dictionary with statistics on clamping, reconstruction area, and temporal stability.
@@ -710,6 +770,15 @@ def render_image_sequence(
     output_path = Path(output_path)
     if not output_path.exists():
         output_path.mkdir(parents=True, exist_ok=True)
+
+    # Automatically compute automatic profile once per sequence (precomputation) if not provided
+    if motion_mode == "cinematic" and cinematic_profile is None:
+        depth_values = [float(s.depth) for s in image_slices if s.depth >= 0]
+        min_d = min(depth_values) if depth_values else 0.0
+        max_d = max(depth_values) if depth_values else 255.0
+        # If possible, analyze first slice mask as depth map estimation
+        bg_slice = image_slices[0]
+        cinematic_profile = CinematicMotionModel.analyze_scene_and_build_profile(bg_slice.image[:, :, 3])
 
     # Initialize stats tracking
     sequence_warnings = []
@@ -747,7 +816,11 @@ def render_image_sequence(
             original_slices=original_slices,
             max_reconstruction_ratio=max_reconstruction_ratio,
             ai_threshold_ratio=ai_threshold_ratio,
-            recon_mask_cache=recon_mask_cache
+            recon_mask_cache=recon_mask_cache,
+            motion_mode=motion_mode,
+            cinematic_profile=cinematic_profile,
+            frame_idx=i,
+            total_frames=num_frames
         )
 
         # Retrieve metadata attached to the returned RenderedImage

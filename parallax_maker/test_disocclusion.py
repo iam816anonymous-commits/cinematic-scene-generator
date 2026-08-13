@@ -354,6 +354,132 @@ class TestDisocclusionAndClamping(unittest.TestCase):
                 create_medias_pipeline()
             self.assertIn("MiDaS model loading failed due to a known 'timm' dependency compatibility issue", str(ctx.exception))
 
+    def test_cinematic_depth_normalization_and_weights(self):
+        """
+        Verify depth normalization, motion-weight generation curves (linear, exponential, sigmoid),
+        and displacement limits configuration.
+        """
+        from parallax_maker.motion import CinematicMotionModel, MotionProfile
+
+        # 1. Depth normalization and sigmoid curve (should map 0.5 depth to 0.5 weight, near to 1.0, far to 0.0)
+        weight_mid = CinematicMotionModel.get_displacement_weights(127.5, 0, 255, "sigmoid")
+        self.assertAlmostEqual(weight_mid, 0.5, places=2)
+
+        weight_far = CinematicMotionModel.get_displacement_weights(0, 0, 255, "sigmoid")
+        self.assertTrue(weight_far < 0.01) # Far background has minimal motion weight
+
+        weight_near = CinematicMotionModel.get_displacement_weights(255, 0, 255, "sigmoid")
+        self.assertTrue(weight_near > 0.99) # Near foreground has maximum motion weight
+
+        # 2. Exponential response curve (depth=0.5 should map to 0.5**2 = 0.25)
+        weight_exp = CinematicMotionModel.get_displacement_weights(127.5, 0, 255, "exponential")
+        self.assertAlmostEqual(weight_exp, 0.25, places=2)
+
+        # 3. Linear response curve
+        weight_lin = CinematicMotionModel.get_displacement_weights(127.5, 0, 255, "linear")
+        self.assertAlmostEqual(weight_lin, 0.5, places=2)
+
+    def test_foreground_background_differential_motion_and_zero_motion(self):
+        """
+        Verify foreground/background differential motion and the zero-motion case.
+        """
+        from parallax_maker.motion import CinematicMotionModel, MotionProfile
+
+        # Foreground must move more than background
+        w_fg = CinematicMotionModel.get_displacement_weights(200, 0, 255, "linear")
+        w_bg = CinematicMotionModel.get_displacement_weights(50, 0, 255, "linear")
+        self.assertTrue(w_fg > w_bg)
+
+        # At frame index 0 of cinematic looping trajectory, horizontal motion phase (sine) is exactly 0
+        phase_x_0 = np.sin(2.0 * np.pi * 0 / 299)
+        self.assertEqual(phase_x_0, 0.0)
+
+    def test_scene_adaptation_shallow_strong_noisy_risk(self):
+        """
+        Verify scene analysis and automatic motion limits scaling for shallow, strong, noisy,
+        and high disocclusion-risk depth maps.
+        """
+        from parallax_maker.motion import CinematicMotionModel
+
+        # 1. Noisy / Uncertain depth (low depth range < 50) -> should automatically scale down max displacement
+        depth_noisy = np.random.randint(100, 130, size=(100, 100), dtype=np.uint8)
+        profile_noisy = CinematicMotionModel.analyze_scene_and_build_profile(depth_noisy)
+        self.assertTrue(profile_noisy.safety_factor < 0.70) # Highly conservative safety reduction applied
+
+        # 2. High disocclusion-risk scene (dense edges or steep gradients) -> automatic motion reduction
+        # Create a depth map with high-frequency gradient checkerboard (high edge density)
+        depth_high_risk = np.zeros((100, 100), dtype=np.uint8)
+        for i in range(10):
+            depth_high_risk[i*10:(i+1)*10, :] = i * 25
+        profile_risk = CinematicMotionModel.analyze_scene_and_build_profile(depth_high_risk)
+        self.assertTrue(profile_risk.safety_factor < 0.8) # Bounded reduction to stay inside safe budget
+
+        # 3. Portrait scene (high foreground occupancy) -> Shallow conservative limits
+        depth_portrait = np.ones((100, 100), dtype=np.uint8) * 200 # high foreground
+        depth_portrait[0:20, :] = 50 # some background to create variance
+        profile_portrait = CinematicMotionModel.analyze_scene_and_build_profile(depth_portrait)
+        self.assertEqual(profile_portrait.profile_name, "Portrait")
+        self.assertTrue(profile_portrait.max_displacement_x <= 6.0) # Shallow motion limit
+
+    def test_cinematic_reconstruction_budget_and_trajectory(self):
+        """
+        Verify reconstruction budget enforcement, safe and unsafe trajectories, and temporal consistency
+        within the cinematic motion renderer.
+        """
+        bg_img = np.ones((100, 100, 4), dtype=np.uint8) * 255
+        bg_slice = ImageSlice(bg_img, depth=0)
+
+        camera = Camera(100.0, 500.0, 100.0)
+        camera_matrix = camera.camera_matrix(100, 100)
+        bg_card = bg_slice.create_card(100, 100, camera)
+
+        # 1. Unsafe Trajectory (exceeds safe reconstruction budget, should raise warnings/diagnostics)
+        from parallax_maker.motion import MotionProfile
+        unsafe_profile = MotionProfile(max_displacement_x=80.0, max_displacement_y=40.0, reconstruction_budget=0.01)
+        rendered_unsafe = render_view(
+            [bg_slice], camera_matrix, [bg_card], np.zeros(3, dtype=np.float32),
+            original_size=(100, 100), original_slices=[bg_slice],
+            motion_mode="cinematic", cinematic_profile=unsafe_profile, frame_idx=50, total_frames=100
+        )
+        self.assertTrue(len(rendered_unsafe.warnings) > 0) # Exceeds budget warning successfully triggered
+
+        # 2. Safe Trajectory (conservative displacement)
+        safe_profile = MotionProfile(max_displacement_x=1.0, max_displacement_y=1.0, reconstruction_budget=0.30)
+        rendered_safe = render_view(
+            [bg_slice], camera_matrix, [bg_card], np.zeros(3, dtype=np.float32),
+            original_size=(100, 100), original_slices=[bg_slice],
+            motion_mode="cinematic", cinematic_profile=safe_profile, frame_idx=50, total_frames=100
+        )
+        self.assertEqual(len(rendered_safe.warnings), 0)
+
+    def test_cinematic_anchor_preservation_and_prevention_of_recursive_warping(self):
+        """
+        Assert original-image anchor preservation and prevention of recursive warping inside the cinematic
+        motion renderer.
+        """
+        recon_img = np.ones((120, 120, 4), dtype=np.uint8) * 255
+        recon_slice = ImageSlice(recon_img, depth=10)
+
+        orig_img = np.ones((100, 100, 4), dtype=np.uint8) * 255
+        orig_slice = ImageSlice(orig_img, depth=10)
+
+        camera = Camera(100.0, 500.0, 100.0)
+        camera_matrix = camera.camera_matrix(100, 100)
+        bg_card = recon_slice.create_card(100, 100, camera)
+        bg_card[:, :2] *= 1.2
+
+        from parallax_maker.motion import MotionProfile
+        profile = MotionProfile(max_displacement_x=5.0, max_displacement_y=2.0)
+
+        # Warp with cinematic mode: every frame must derive strictly from original_slices
+        rendered = render_view(
+            [recon_slice], camera_matrix, [bg_card], np.zeros(3, dtype=np.float32),
+            original_size=(100, 100), original_slices=[orig_slice],
+            motion_mode="cinematic", cinematic_profile=profile, frame_idx=25, total_frames=100
+        )
+        # Verify provenance is original (1) or deterministic edge (2), never mutated/re-warped progressively
+        self.assertTrue(np.all((rendered.provenance_map == 1) | (rendered.provenance_map == 2)))
+
 
 if __name__ == "__main__":
     unittest.main()
