@@ -359,9 +359,10 @@ def render_view(
 
     # Pixel provenance map tracking:
     # 0: Empty/transparent (out of bounds)
-    # 1: Original/depth-warped content
-    # 2: Deterministic reconstructed content
-    # 3: AI reconstructed content
+    # 1: ORIGINAL_SOURCE
+    # 2: DEPTH_REPROJECTED_SOURCE
+    # 3: REFERENCE_RECONSTRUCTED
+    # 4: TEMPORARY_EDGE_FILL
     provenance_map = np.zeros((h_orig, w_orig), dtype=np.uint8)
     ai_used = False
 
@@ -370,14 +371,10 @@ def render_view(
         (h_orig, w_orig, 4),
         dtype=np.uint8,
     )
-    rendered_image[:, :, 3] = 1
+    rendered_image[:, :, 3] = 0
 
     # Background layer (i == 0) decision and rendering logic
     bg_slice = image_slices[0]
-    bg_orig_slice = original_slices[0] if original_slices is not None else None
-
-    # Get dimensions
-    cur_h, cur_w = bg_slice.image.shape[:2]
 
     # Calculate cinematic card positions and rotations
     if start_camera_position is None:
@@ -405,8 +402,6 @@ def render_view(
     max_safe_px_y = 0.1 * h_orig
 
     # Setup the target screen-space lateral pixel shifts.
-    # If the trajectory lacks horizontal/vertical motion (e.g. pure Z push), we generate a smooth, professional
-    # lateral sweep (micro-orbit dolly pan) over the sequence to create rich, visible cinematic 3D depth perception.
     if np.allclose(raw_dt[:2], 0.0, atol=1e-3):
         # Loopable sine sweep that starts and ends exactly at 0.0 (the pristine original composition)
         sweep_x = np.sin(np.pi * t)
@@ -540,62 +535,21 @@ def render_view(
         card_final = card_rot + np.array([0, 0, z_anchor], dtype=np.float32)
         cinematic_cards.append(card_final)
 
-    # Reconstruct continuous depth map from slices if not passed
-    if depth_map is None:
-        depth_map = np.zeros((h_orig, w_orig), dtype=np.uint8)
-        for i, slice_image in enumerate(image_slices):
-            cur_h, cur_w = slice_image.image.shape[:2]
-            if cur_h == h_orig and cur_w == w_orig:
-                alpha = slice_image.image[:, :, 3]
-            else:
-                alpha = slice_image.image[
-                    (cur_h - h_orig)//2 : (cur_h - h_orig)//2 + h_orig,
-                    (cur_w - w_orig)//2 : (cur_w - w_orig)//2 + w_orig,
-                    3
-                ]
-            depth_map[alpha > 10] = int(slice_image.depth)
+    # Compute actual screen-space displacements in pixels
+    r_zero = np.zeros((3, 1), dtype=np.float32)
+    t_zero = -start_camera_position.reshape(3, 1)
 
-    # Disparity map and visual anchor value
-    disparity_map = depth_map.astype(np.float32) / 255.0
-    disparity_anchor_val = float(image_slices[anchor_idx].depth) / 255.0
+    # original projection (no translation/orbit)
+    corners_2d_orig_list = []
+    for card in card_corners_3d_list:
+        proj_orig, _ = cv2.projectPoints(card, r_zero, t_zero, camera_matrix, None)
+        corners_2d_orig_list.append(proj_orig.reshape(-1, 2))
 
-    # Normalize disparity map relative to actual segmented active depth range to preserve exact 1:1 screen pixel disparity scale
-    depth_depths = [float(s.depth) for s in image_slices]
-    depth_min = min(depth_depths) if depth_depths else 0.0
-    depth_max = max(depth_depths) if depth_depths else 255.0
-    depth_range = max(1.0, depth_max - depth_min)
-
-    disparity_map_normalized = (depth_map - depth_min) / depth_range
-    disparity_anchor_normalized = (float(image_slices[anchor_idx].depth) - depth_min) / depth_range
-    disparity_rel = (disparity_map_normalized - disparity_anchor_normalized).astype(np.float32)
-
-    # Continuous perspective projection matching Z scaling (Z_pix distance from camera)
-    z_pix = 500.0 * ((255.0 - depth_map) / 255.0)
-    Z_pix = z_pix - start_camera_position[2]
-    scale_factor = np.where(np.abs(Z_pix - scaled_dz) > 1e-3, Z_pix / (Z_pix - scaled_dz), 1.0).astype(np.float32)
-
-    # Edge protection based on depth discontinuities
-    depth_grad = cv2.Laplacian(depth_map, cv2.CV_32F)
-    edge_discontinuity = np.abs(depth_grad) > 15
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    dilated_edges = cv2.dilate(edge_discontinuity.astype(np.uint8), kernel, iterations=1)
-
-    # Layer sorted depths
-    slice_depths = sorted([float(s.depth) for s in image_slices])
-
-    # Precalculate static grid of coordinates once per frame
-    grid_x, grid_y = np.meshgrid(np.arange(w_orig, dtype=np.float32), np.arange(h_orig, dtype=np.float32))
-
-    # Precalculate remapping base coordinates to avoid redundant additions
-    base_map_x = (grid_x - w_orig/2) * scale_factor + w_orig/2
-    base_map_y = (grid_y - h_orig/2) * scale_factor + h_orig/2
-
-    # Dense disparity-driven backward remapping coordinates
-    shift_x = (pixel_shift_x * disparity_rel).astype(np.float32)
-    shift_y = (pixel_shift_y * disparity_rel).astype(np.float32)
-
-    # Temporary variable to compute background disocclusion ratio
-    disocclusion_ratio = 0.0
+    # cinematic projection
+    corners_2d_cin_list = []
+    for c_card in cinematic_cards:
+        proj_cin, _ = cv2.projectPoints(c_card, r_zero, t_zero, camera_matrix, None)
+        corners_2d_cin_list.append(proj_cin.reshape(-1, 2))
 
     # Reference-View / Image-Based View Synthesis Warp (Back to Front)
     for i in range(len(image_slices)):
@@ -607,7 +561,7 @@ def render_view(
         pad_w = (cur_w - w_orig) // 2
 
         # Get original reference unpadded image
-        if orig_slice is not None:
+        if orig_slice is not None and orig_slice.image.shape[0] == h_orig and orig_slice.image.shape[1] == w_orig:
             src_img = orig_slice.image
         else:
             src_img = slice_image.image[pad_h:pad_h+h_orig, pad_w:pad_w+w_orig].copy()
@@ -639,10 +593,21 @@ def render_view(
         # Keep original reference pixels completely crisp and unaltered where shift is negligible!
         warped_orig[small_shift_mask] = src_img[small_shift_mask]
 
-        # Reference-based disocclusion: remap from precomputed padded reference slice
-        map_x_padded = map_x + pad_w
-        map_y_padded = map_y + pad_h
-        warped_padded = cv2.remap(slice_image.image, map_x_padded, map_y_padded, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0,0))
+        if is_layer_static:
+            warped_orig = src_img
+            warped_padded = slice_image.image[pad_h:pad_h+h_orig, pad_w:pad_w+w_orig]
+        else:
+            # Padded perspective transform
+            padded_src_corners = np.array([[0, 0], [cur_w, 0], [cur_w, cur_h], [0, cur_h]], dtype=np.float32)
+            H_padded_i = cv2.getPerspectiveTransform(padded_src_corners, corners_2d_cin_list[i])
+            warped_padded = cv2.warpPerspective(slice_image.image, H_padded_i, (w_orig, h_orig), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0,0))
+
+            # Unpadded perspective transform
+            unpadded_src_corners = np.array([[0, 0], [w_orig, 0], [w_orig, h_orig], [0, h_orig]], dtype=np.float32)
+            unpadded_in_padded_coords = np.array([[pad_w, pad_h], [pad_w + w_orig, pad_h], [pad_w + w_orig, pad_h + h_orig], [pad_w, pad_h + h_orig]], dtype=np.float32)
+            corners_2d_cin_unpadded = cv2.perspectiveTransform(unpadded_in_padded_coords.reshape(-1, 1, 2), H_padded_i).reshape(-1, 2)
+            H_unpadded_i = cv2.getPerspectiveTransform(unpadded_src_corners, corners_2d_cin_unpadded)
+            warped_orig = cv2.warpPerspective(src_img, H_unpadded_i, (w_orig, h_orig), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0,0))
 
         # Occlusion-aware compositing inside target-space layer's domain
         layer_unpadded_active = (warped_orig[:, :, 3] > 10) & warped_layer_mask
@@ -659,11 +624,9 @@ def render_view(
             layer_composite[:, :, c] = np.where(layer_unpadded_active, warped_orig[:, :, c],
                                                 np.where(layer_padded_active, warped_padded[:, :, c], 0))
 
-        layer_orig_pristine = layer_unpadded_active & small_shift_mask
         layer_provenance = np.zeros((h_orig, w_orig), dtype=np.uint8)
-        layer_provenance = np.where(layer_padded_active, 3, layer_provenance)
-        layer_provenance = np.where(layer_unpadded_active, 2, layer_provenance)
-        layer_provenance = np.where(layer_orig_pristine, 1, layer_provenance)
+        layer_provenance = np.where(layer_padded_active, 3, layer_provenance)  # REFERENCE_RECONSTRUCTED
+        layer_provenance = np.where(layer_unpadded_active, 2 if not is_layer_static else 1, layer_provenance)  # DEPTH_REPROJECTED_SOURCE or ORIGINAL_SOURCE
 
         # Vectorized alpha blending across all channels
         alpha_channel = layer_composite[:, :, 3].astype(np.float32) / 255.0
@@ -674,10 +637,13 @@ def render_view(
         # Write layer provenance to the main provenance map using vectorized np.where
         provenance_map = np.where(layer_provenance > 0, layer_provenance, provenance_map)
 
-        # Calculate disocclusion ratio of background layer for warning reporting
-        if i == 0:
-            disocclusion_hole_mask = cv2.inRange(warped_orig[:, :, 3], 0, 10)
-            disocclusion_ratio = float(cv2.countNonZero(disocclusion_hole_mask)) / float(h_orig * w_orig)
+    # Perform final temporary edge fill (inpainting) on any remaining transparent boundary pixels
+    empty_mask = cv2.inRange(rendered_image[:, :, 3], 0, 254)
+    if cv2.countNonZero(empty_mask) > 0:
+        filled_rgb = cv2.inpaint(rendered_image[:, :, :3], empty_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+        rendered_image[:, :, :3] = np.where(np.expand_dims(empty_mask > 0, axis=2), filled_rgb, rendered_image[:, :, :3])
+        rendered_image[:, :, 3] = 255
+        provenance_map = np.where(empty_mask > 0, 4, provenance_map)  # TEMPORARY_EDGE_FILL
 
     # Compute final reconstructed-pixel ratio strictly AFTER compositing
     reconstructed_pixels = np.count_nonzero((provenance_map == 3) | (provenance_map == 4))
@@ -700,28 +666,12 @@ def render_view(
     final_output.actual_camera_displacement = float(np.linalg.norm(raw_dt))
     final_output.normalized_parallax_strength = float(parallax_strength)
     final_output.maximum_layer_displacement = float(max(np.linalg.norm([dx_layers[i], dy_layers[i], dz_layers[i]]) for i in range(len(image_slices))))
-    final_output.foreground_displacement = float(np.linalg.norm([dx_layers[-1], dy_layers[-1], dz_layers[-1]])) if len(dx_layers) > 0 else 0.0
-    final_output.middleground_displacement = float(np.linalg.norm([dx_layers[anchor_idx], dy_layers[anchor_idx], dz_layers[anchor_idx]])) if len(dx_layers) > 0 else 0.0
-    final_output.background_displacement = float(np.linalg.norm([dx_layers[0], dy_layers[0], dz_layers[0]])) if len(dx_layers) > 0 else 0.0
-    final_output.foreground_lateral_displacement = float(np.linalg.norm([dx_layers[-1], dy_layers[-1]])) if len(dx_layers) > 0 else 0.0
-    final_output.middleground_lateral_displacement = float(np.linalg.norm([dx_layers[anchor_idx], dy_layers[anchor_idx]])) if len(dx_layers) > 0 else 0.0
-    final_output.background_lateral_displacement = float(np.linalg.norm([dx_layers[0], dy_layers[0]])) if len(dx_layers) > 0 else 0.0
-
-    # Compute actual screen-space displacements in pixels
-    r_zero = np.zeros((3, 1), dtype=np.float32)
-    t_zero = -start_camera_position.reshape(3, 1)
-
-    # original projection (no translation/orbit)
-    corners_2d_orig_list = []
-    for card in card_corners_3d_list:
-        proj_orig, _ = cv2.projectPoints(card, r_zero, t_zero, camera_matrix, None)
-        corners_2d_orig_list.append(proj_orig.reshape(-1, 2))
-
-    # cinematic projection
-    corners_2d_cin_list = []
-    for c_card in cinematic_cards:
-        proj_cin, _ = cv2.projectPoints(c_card, r_zero, t_zero, camera_matrix, None)
-        corners_2d_cin_list.append(proj_cin.reshape(-1, 2))
+    final_output.foreground_displacement = float(np.linalg.norm([dx_layers[-1], dy_layers[-1], dz_layers[-1]])) if len(image_slices) > 0 else 0.0
+    final_output.middleground_displacement = float(np.linalg.norm([dx_layers[anchor_idx], dy_layers[anchor_idx], dz_layers[anchor_idx]])) if len(image_slices) > 0 else 0.0
+    final_output.background_displacement = float(np.linalg.norm([dx_layers[0], dy_layers[0], dz_layers[0]])) if len(image_slices) > 0 else 0.0
+    final_output.foreground_lateral_displacement = float(np.linalg.norm([dx_layers[-1], dy_layers[-1]])) if len(image_slices) > 0 else 0.0
+    final_output.middleground_lateral_displacement = float(np.linalg.norm([dx_layers[anchor_idx], dy_layers[anchor_idx]])) if len(image_slices) > 0 else 0.0
+    final_output.background_lateral_displacement = float(np.linalg.norm([dx_layers[0], dy_layers[0]])) if len(image_slices) > 0 else 0.0
 
     # Calculate screen space pixel displacements
     disp_layers_px = []
