@@ -1936,6 +1936,464 @@ def make_navigation_callbacks(app):
         return state.serve_main_image(image), logs, True
 
 
+def make_preview_container():
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Label("Movement", className="font-bold"),
+                    dcc.Dropdown(
+                        id=C.DROPDOWN_PREVIEW_MOVEMENT,
+                        options=[
+                            {"label": "Cinematic Auto", "value": "Cinematic Auto"},
+                            {"label": "Dolly Push", "value": "Dolly Push"},
+                            {"label": "Zoom-in", "value": "Zoom-in"},
+                            {"label": "Orbit", "value": "Orbit"},
+                            {"label": "Micro-orbit", "value": "Micro-orbit"},
+                        ],
+                        value="Cinematic Auto",
+                        className="general-dropdown mb-2",
+                    ),
+                    html.Label("Strength", className="font-bold"),
+                    dcc.Dropdown(
+                        id=C.DROPDOWN_PREVIEW_STRENGTH,
+                        options=[
+                            {"label": "Subtle (Very Bounded)", "value": "Subtle"},
+                            {"label": "Cinematic (Balanced 3D)", "value": "Cinematic"},
+                            {"label": "Dynamic (Aggressive)", "value": "Dynamic"},
+                            {"label": "Dramatic (Maximum effect)", "value": "Dramatic"},
+                        ],
+                        value="Cinematic",
+                        className="general-dropdown mb-2",
+                    ),
+                    html.Label("Motion", className="font-bold"),
+                    dcc.Dropdown(
+                        id=C.DROPDOWN_PREVIEW_MOTION,
+                        options=[
+                            {"label": "Auto", "value": "Auto"},
+                            {"label": "Pan Left", "value": "Pan Left"},
+                            {"label": "Pan Right", "value": "Pan Right"},
+                            {"label": "Orbit CW", "value": "Orbit CW"},
+                            {"label": "Orbit CCW", "value": "Orbit CCW"},
+                        ],
+                        value="Auto",
+                        className="general-dropdown mb-2",
+                    ),
+                    html.Label("Duration", className="font-bold"),
+                    dcc.Dropdown(
+                        id=C.DROPDOWN_PREVIEW_DURATION,
+                        options=[
+                            {"label": "2 sec", "value": "2.0"},
+                            {"label": "4 sec", "value": "4.0"},
+                            {"label": "6 sec", "value": "6.0"},
+                        ],
+                        value="4.0",
+                        className="general-dropdown mb-2",
+                    ),
+                    html.Label("Loop Settings", className="mt-2 block font-bold"),
+                    dcc.RadioItems(
+                        id=C.RADIO_PREVIEW_LOOP,
+                        options=[
+                            {"label": "ON (Loop Trajectory)", "value": "ON"},
+                            {"label": "OFF (Linear / Ease)", "value": "OFF"},
+                        ],
+                        value="ON",
+                        className="p-1 mb-2",
+                        inputClassName="mr-1",
+                    ),
+                    html.Label("Preview Quality", className="font-bold"),
+                    dcc.Dropdown(
+                        id=C.DROPDOWN_PREVIEW_QUALITY,
+                        options=[
+                            {"label": "Fast (24 frames)", "value": "Fast"},
+                            {"label": "Balanced (36 frames)", "value": "Balanced"},
+                            {"label": "Quality (48 frames)", "value": "Quality"},
+                        ],
+                        value="Balanced",
+                        className="general-dropdown mb-2",
+                    ),
+                ],
+                className="grid grid-cols-1 gap-1 p-2",
+            ),
+            html.Div(
+                [
+                    html.Button(
+                        html.Div(
+                            [
+                                html.Label("Generate Preview"),
+                                html.I(className="fa-solid fa-play pl-1"),
+                            ]
+                        ),
+                        id=C.BTN_PREVIEW_GENERATE,
+                        className="general-element mb-2 w-full",
+                    ),
+                ],
+                className="p-2",
+            ),
+            # Video Preview Player Component
+            html.Div(
+                [
+                    html.Video(
+                        id=C.VIDEO_PREVIEW_PLAYER,
+                        controls=True,
+                        autoPlay=True,
+                        loop=True,
+                        muted=True,
+                        className="w-full general-border hidden",
+                        style={"maxHeight": "240px"},
+                    ),
+                ],
+                className="p-2",
+            ),
+            # Timeline Scrubbing Slider
+            html.Div(
+                [
+                    html.Label("Interactive Timeline Scrubbing", className="font-bold"),
+                    dcc.Slider(
+                        id=C.SLIDER_PREVIEW_SCRUBBER,
+                        min=0,
+                        max=35,
+                        step=1,
+                        value=0,
+                        marks=None,
+                        tooltip={"placement": "bottom", "always_visible": True},
+                    ),
+                ],
+                className="p-2",
+            ),
+            # Safety Warnings Block
+            html.Div(
+                id=C.DIV_PREVIEW_SAFETY_MSG,
+                className="p-2 text-sm text-yellow-600 font-semibold hidden",
+            ),
+            # Quality Indicators Block
+            html.Div(
+                id=C.DIV_PREVIEW_QUALITY_INDICATORS,
+                className="p-2 text-sm font-medium",
+            ),
+            # Developer Diagnostics Panel (Collapsed)
+            html.Details(
+                [
+                    html.Summary("Developer Diagnostics", className="cursor-pointer font-bold p-1 text-sm"),
+                    html.Div(
+                        id=C.DIV_PREVIEW_DIAGNOSTICS,
+                        className="p-2 text-xs font-mono light-border",
+                    ),
+                ],
+                className="p-1",
+            ),
+            # Direct "Render Full Quality" Button
+            html.Div(
+                [
+                    html.Button(
+                        "Render Full Quality",
+                        id=C.BTN_PREVIEW_RENDER_FINAL,
+                        className="color-is-selected p-2 rounded-md mt-2 w-full font-bold",
+                    ),
+                    dcc.Loading(
+                        id="loading-preview-render-final",
+                        children=html.Div(id="preview-render-final-output")
+                    )
+                ],
+                className="p-2",
+            ),
+        ],
+        className="w-full",
+    )
+
+
+def make_preview_callbacks(app):
+    from .preview.preview_models import MotionIntent
+    from .preview.preview_controller import PreviewController
+
+    @app.callback(
+        Output(C.VIDEO_PREVIEW_PLAYER, "src"),
+        Output(C.VIDEO_PREVIEW_PLAYER, "className"),
+        Output(C.SLIDER_PREVIEW_SCRUBBER, "max"),
+        Output(C.DIV_PREVIEW_SAFETY_MSG, "children"),
+        Output(C.DIV_PREVIEW_SAFETY_MSG, "className"),
+        Output(C.DIV_PREVIEW_QUALITY_INDICATORS, "children"),
+        Output(C.DIV_PREVIEW_DIAGNOSTICS, "children"),
+        Output(C.LOGS_DATA, "data", allow_duplicate=True),
+        Input(C.BTN_PREVIEW_GENERATE, "n_clicks"),
+        State(C.STORE_APPSTATE_FILENAME, "data"),
+        State(C.DROPDOWN_PREVIEW_MOVEMENT, "value"),
+        State(C.DROPDOWN_PREVIEW_STRENGTH, "value"),
+        State(C.DROPDOWN_PREVIEW_MOTION, "value"),
+        State(C.DROPDOWN_PREVIEW_DURATION, "value"),
+        State(C.RADIO_PREVIEW_LOOP, "value"),
+        State(C.DROPDOWN_PREVIEW_QUALITY, "value"),
+        State(C.LOGS_DATA, "data"),
+        running=[(Output(C.BTN_PREVIEW_GENERATE, "disabled"), True, False)],
+        prevent_initial_call=True,
+    )
+    def handle_preview_generation(
+        n_clicks, filename, movement, strength, motion, duration, loop_opt, quality, logs
+    ):
+        if n_clicks is None or filename is None:
+            raise PreventUpdate()
+
+        state = AppState.from_cache(filename)
+        if state.imgData is None or state.depthMapData is None:
+            logs.append("Error: Input image or depth map not available.")
+            return no_update, no_update, no_update, no_update, "hidden", no_update, no_update, logs
+
+        logs.append(f"Generating Parallax Preview for style: {movement}, strength: {strength}...")
+
+        loop_val = (loop_opt == "ON")
+        duration_val = float(duration)
+
+        intent = MotionIntent(
+            movement_style=movement,
+            strength_level=strength,
+            motion_direction=motion,
+            duration=duration_val,
+            loop=loop_val
+        )
+
+        try:
+            # 1. Run scene analysis & motion plan
+            analysis = PreviewController.get_scene_analysis(state)
+            plan = PreviewController.get_motion_plan(state, intent)
+
+            # 2. Render preview result
+            result = PreviewController.generate_preview(state, intent, quality=quality)
+            logs.append(f"Preview generated successfully! Video URL: {result.video_url} (Cache hit: {result.cache_hit})")
+
+            # Determine scrubber slider max index
+            max_frame = len(result.frame_urls) - 1
+
+            # Build Safety Message
+            warning_msg = ""
+            warning_class = "hidden"
+            if plan.was_reduced:
+                warning_msg = "Motion automatically reduced to preserve image quality."
+                warning_class = "p-2 text-sm text-yellow-600 font-semibold"
+
+            # Build Quality Indicators
+            quality_html = html.Div([
+                html.Div(f"✓ Depth quality: {analysis.quality_indicator}", className="text-green-600 font-semibold"),
+                html.Div(f"✓ Subject stability: {'Excellent' if analysis.primary_subject_detected else 'Good'}", className="text-green-600"),
+                html.Div(f"✓ Reconstruction risk: {'Low' if analysis.disocclusion_risk == 'Low' else 'Medium'}", className="text-green-600"),
+                html.Div(f"✓ Motion safety: {analysis.safety_status}", className="text-green-600"),
+            ])
+
+            # Build Diagnostics Panel
+            diag_html = html.Div([
+                html.P(f"Scene Type: {analysis.scene_type}"),
+                html.P(f"Primary Subject Detected: {analysis.primary_subject_detected}"),
+                html.P(f"Depth Confidence: {analysis.depth_confidence:.2f}"),
+                html.P(f"Max Disocclusion Risk: {analysis.disocclusion_risk}"),
+                html.P(f"Target Disparity (screen): {plan.target_screen_disparity:.1f} px"),
+                html.P(f"Predicted Reconstruction: {plan.predicted_reconstruction_ratio*100:.2f}%"),
+                html.P(f"Actual Strength Multiplier: {plan.actual_strength_multiplier:.2f}"),
+            ])
+
+            return (
+                result.video_url,
+                "w-full general-border",
+                max_frame,
+                warning_msg,
+                warning_class,
+                quality_html,
+                diag_html,
+                logs
+            )
+
+        except Exception as e:
+            err_msg = f"Preview could not be generated: {str(e)}"
+            logs.append(err_msg)
+            return (
+                no_update,
+                "hidden",
+                no_update,
+                err_msg,
+                "p-2 text-sm text-red-600 font-semibold",
+                no_update,
+                no_update,
+                logs
+            )
+
+    @app.callback(
+        Output(C.IMAGE, "src", allow_duplicate=True),
+        Input(C.SLIDER_PREVIEW_SCRUBBER, "value"),
+        State(C.STORE_APPSTATE_FILENAME, "data"),
+        State(C.DROPDOWN_PREVIEW_MOVEMENT, "value"),
+        State(C.DROPDOWN_PREVIEW_STRENGTH, "value"),
+        State(C.DROPDOWN_PREVIEW_MOTION, "value"),
+        State(C.DROPDOWN_PREVIEW_DURATION, "value"),
+        State(C.RADIO_PREVIEW_LOOP, "value"),
+        State(C.DROPDOWN_PREVIEW_QUALITY, "value"),
+        prevent_initial_call=True,
+    )
+    def handle_timeline_scrubbing(
+        frame_idx, filename, movement, strength, motion, duration, loop_opt, quality
+    ):
+        if filename is None or frame_idx is None:
+            raise PreventUpdate()
+
+        state = AppState.from_cache(filename)
+        loop_val = (loop_opt == "ON")
+        duration_val = float(duration)
+
+        intent = MotionIntent(
+            movement_style=movement,
+            strength_level=strength,
+            motion_direction=motion,
+            duration=duration_val,
+            loop=loop_val
+        )
+
+        try:
+            # Query cached result
+            img_hash = PreviewCache.compute_image_hash(state.imgData)
+            depth_hash = PreviewCache.compute_image_hash(state.depthMapData)
+            analysis = PreviewController.get_scene_analysis(state)
+            scene_analysis_hash = PreviewCache.compute_image_hash(str(analysis.diagnostics))
+
+            cache_key = PreviewCache.get_cache_key(
+                image_hash=img_hash,
+                depth_hash=depth_hash,
+                scene_analysis_hash=scene_analysis_hash,
+                movement_style=movement,
+                strength_level=strength,
+                motion_direction=motion,
+                duration=duration_val,
+                loop=loop_val,
+                quality_level=quality
+            )
+
+            result = PreviewCache.get(cache_key)
+            if result is not None and frame_idx < len(result.frame_urls):
+                return result.frame_urls[frame_idx]
+        except Exception:
+            pass
+
+        raise PreventUpdate()
+
+    @app.callback(
+        Output(C.LOGS_DATA, "data", allow_duplicate=True),
+        Output("preview-render-final-output", "children"),
+        Output(C.DOWNLOAD_ANIMATION, "data", allow_duplicate=True),
+        Input(C.BTN_PREVIEW_RENDER_FINAL, "n_clicks"),
+        State(C.STORE_APPSTATE_FILENAME, "data"),
+        State(C.DROPDOWN_PREVIEW_MOVEMENT, "value"),
+        State(C.DROPDOWN_PREVIEW_STRENGTH, "value"),
+        State(C.DROPDOWN_PREVIEW_MOTION, "value"),
+        State(C.DROPDOWN_PREVIEW_DURATION, "value"),
+        State(C.RADIO_PREVIEW_LOOP, "value"),
+        State(C.LOGS_DATA, "data"),
+        running=[(Output(C.BTN_PREVIEW_RENDER_FINAL, "disabled"), True, False)],
+        prevent_initial_call=True,
+    )
+    def handle_preview_render_final(
+        n_clicks, filename, movement, strength, motion, duration, loop_opt, logs
+    ):
+        if n_clicks is None or filename is None:
+            raise PreventUpdate()
+
+        state = AppState.from_cache(filename)
+        if not state.image_slices or len(state.image_slices) == 0:
+            err = "No image slices generated yet. Please generate slices first."
+            logs.append(err)
+            return logs, err, no_update
+
+        logs.append("Executing full quality production render from planned motion trajectory...")
+
+        # Setup identical motion parameters
+        loop_val = (loop_opt == "ON")
+        duration_val = float(duration)
+        intent = MotionIntent(
+            movement_style=movement,
+            strength_level=strength,
+            motion_direction=motion,
+            duration=duration_val,
+            loop=loop_val
+        )
+
+        analysis = PreviewController.get_scene_analysis(state)
+        plan = PreviewController.get_motion_plan(state, intent)
+
+        camera_distance = state.camera.camera_distance
+        camera_matrix = state.camera_matrix()
+
+        has_valid_filenames = state.image_slices and all(slice_image.filename is not None for slice_image in state.image_slices)
+
+        margin = 0.1
+        if has_valid_filenames:
+            reconstructed_slices = state.get_reconstructed_slices(margin=margin, use_ai=False)
+            scale_factor = 1.0 + 2.0 * margin
+            card_corners_3d_list = state.get_cards()
+            for card in card_corners_3d_list:
+                card[:, :2] *= scale_factor
+            original_size = (state.imgData.size[1], state.imgData.size[0])
+        else:
+            reconstructed_slices = state.image_slices
+            card_corners_3d_list = state.get_cards()
+            original_size = None
+
+        # Build production rendering path exactly using the same MotionPlan states
+        num_frames = 100  # Default production frames
+        start_camera_position = np.array([0.0, 0.0, -100.0], dtype=np.float32)
+
+        for i in range(num_frames):
+            t_val = float(i) / (num_frames - 1) if num_frames > 1 else 0.0
+
+            # Map index matching t_val to the plan trajectory
+            traj_idx = int(t_val * (len(plan.trajectory) - 1))
+            st = plan.trajectory[traj_idx]
+
+            # Reconstruct exact camera position
+            camera_position = np.array([st["x"], st["y"], -100.0 + st["z"] / 100.0 * 50.0], dtype=np.float32)
+
+            rendered_frame = render_view(
+                reconstructed_slices,
+                camera_matrix,
+                card_corners_3d_list,
+                camera_position,
+                original_size=original_size,
+                original_slices=state.image_slices,
+                max_reconstruction_ratio=0.15,
+                ai_threshold_ratio=0.08,
+                perceptual_parallax_strength=1.0,
+                t=t_val,
+                start_camera_position=start_camera_position,
+                zoom_strength=0.0,
+                rotation_strength=0.0,
+            )
+
+            # Save frame to disk
+            frame_name = f"rendered_image_{i:03d}.png"
+            cv2.imwrite(str(Path(filename) / frame_name), cv2.cvtColor(rendered_frame, cv2.COLOR_RGBA2BGR))
+
+        logs.append(f"Exported {num_frames} production frames successfully.")
+
+        # Compile final high-quality MP4 video
+        from .video_compiler import compile_frames_to_mp4
+        mp4_filename = "animation.mp4"
+        mp4_path = Path(filename) / mp4_filename
+
+        try:
+            compile_frames_to_mp4(
+                frame_dir=Path(filename),
+                output_path=mp4_path,
+                fps=24,
+                width=1920,
+                height=1080,
+                pattern="rendered_image_%03d.png"
+            )
+            logs.append(f"Successfully compiled direct high-quality MP4 video at {mp4_path}")
+            msg = "Animation rendered successfully as MP4!"
+            download_data = dcc.send_file(str(mp4_path))
+        except Exception as e:
+            error_msg = f"Video compilation failed: {str(e)}"
+            logs.append(error_msg)
+            msg = f"Error during export: {str(e)}"
+            download_data = no_update
+
+        return logs, msg, download_data
+
+
 def make_mode_selector():
     return html.Div(
         [
