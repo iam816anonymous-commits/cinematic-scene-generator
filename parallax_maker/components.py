@@ -366,6 +366,187 @@ def make_depth_map_container(depth_map_id: str = C.CTR_DEPTH_MAP):
     )
 
 
+def make_preview_container():
+    return html.Div(
+        [
+            html.H3("PARALLAX PREVIEW", className="font-bold text-lg mb-4 text-center"),
+
+            # Interactive player viewport
+            html.Div(
+                [
+                    html.Img(
+                        id="preview-viewport-image",
+                        className="w-full h-full object-contain max-h-96 general-border",
+                        style={"backgroundColor": "#000"},
+                    ),
+                    dcc.Loading(
+                        id="loading-preview",
+                        children=[],
+                        type="circle"
+                    ),
+                ],
+                className="relative flex justify-center items-center w-full mb-4",
+                style={"height": "40vh"}
+            ),
+
+            # Timeline / Slider
+            html.Div(
+                [
+                    dcc.Slider(
+                        id="preview-frame-slider",
+                        min=0,
+                        max=35,
+                        step=1,
+                        value=0,
+                        marks=None,
+                        tooltip={"placement": "bottom", "always_visible": True},
+                    ),
+                    html.Div(id="preview-frame-text", className="text-center font-semibold mt-2"),
+                ],
+                className="w-full mb-4"
+            ),
+
+            # Playback Controls
+            html.Div(
+                [
+                    html.Button("▶ Play", id="btn-preview-play", className="general-element px-4 py-2 mr-2"),
+                    html.Button("❚❚ Pause", id="btn-preview-pause", className="general-element px-4 py-2 mr-2"),
+                    html.Button("◀ Back", id="btn-preview-prev", className="general-element px-4 py-2 mr-2"),
+                    html.Button("Next ▶", id="btn-preview-next", className="general-element px-4 py-2"),
+                    dcc.Interval(id="preview-play-interval", interval=100, disabled=True, n_intervals=0),
+                ],
+                className="flex justify-center mb-6"
+            ),
+
+            # High-level controls
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Label("Movement", className="font-bold block mb-1"),
+                            dcc.Dropdown(
+                                id="preview-motion-style",
+                                options=[
+                                    {"label": "Cinematic Auto", "value": "Cinematic Auto"},
+                                    {"label": "Horizontal Pan", "value": "Horizontal Pan"},
+                                    {"label": "Vertical Pan", "value": "Vertical Pan"},
+                                    {"label": "Push-In (Zoom)", "value": "Push-In (Zoom)"},
+                                    {"label": "Orbit Dolly", "value": "Orbit Dolly"},
+                                ],
+                                value="Cinematic Auto",
+                                className="general-dropdown w-full"
+                            ),
+                        ],
+                        className="mb-3"
+                    ),
+                    html.Div(
+                        [
+                            html.Label("Strength", className="font-bold block mb-1"),
+                            dcc.Dropdown(
+                                id="preview-motion-strength",
+                                options=[
+                                    {"label": "Subtle", "value": "Subtle"},
+                                    {"label": "Cinematic", "value": "Cinematic"},
+                                    {"label": "Dynamic", "value": "Dynamic"},
+                                    {"label": "Dramatic", "value": "Dramatic"},
+                                ],
+                                value="Cinematic",
+                                className="general-dropdown w-full"
+                            ),
+                        ],
+                        className="mb-3"
+                    ),
+                    html.Div(
+                        [
+                            html.Label("Preview Quality", className="font-bold block mb-1"),
+                            dcc.Dropdown(
+                                id="preview-quality-dropdown",
+                                options=[
+                                    {"label": "Fast", "value": "Fast"},
+                                    {"label": "Balanced", "value": "Balanced"},
+                                    {"label": "Quality", "value": "Quality"},
+                                ],
+                                value="Balanced",
+                                className="general-dropdown w-full"
+                            ),
+                        ],
+                        className="mb-3"
+                    ),
+                    html.Div(
+                        [
+                            html.Label("Duration (sec)", className="font-bold block mb-1"),
+                            dcc.Dropdown(
+                                id="preview-duration",
+                                options=[
+                                    {"label": "2 sec", "value": 2},
+                                    {"label": "4 sec", "value": 4},
+                                    {"label": "6 sec", "value": 6},
+                                ],
+                                value=4,
+                                className="general-dropdown w-full"
+                            ),
+                        ],
+                        className="mb-3"
+                    ),
+                    html.Div(
+                        [
+                            dcc.Checklist(
+                                id="preview-loop-toggle",
+                                options=[{"label": " Loop Behavior (ON)", "value": "ON"}],
+                                value=["ON"],
+                                className="font-bold p-2"
+                            ),
+                        ],
+                        className="mb-4"
+                    ),
+                ],
+                className="grid grid-cols-2 gap-4"
+            ),
+
+            # Simple Quality Indicators
+            html.Div(
+                [
+                    html.Label("PREVIEW STATUS", className="font-bold block mb-2"),
+                    html.Div(id="preview-safety-warning", className="text-amber-500 font-bold mb-2"),
+                    html.Div(
+                        [
+                            html.Div(id="indicator-depth-quality", className="p-1 font-semibold"),
+                            html.Div(id="indicator-subject-stability", className="p-1 font-semibold"),
+                            html.Div(id="indicator-reconstruction-risk", className="p-1 font-semibold"),
+                            html.Div(id="indicator-motion-safety", className="p-1 font-semibold"),
+                        ],
+                        className="general-border p-2 bg-slate-50 dark:bg-slate-800 text-sm mb-4"
+                    )
+                ]
+            ),
+
+            html.Div(
+                [
+                    html.Button("▶ Generate Preview", id="btn-generate-preview", className="w-full color-is-selected font-bold py-2 rounded-md mb-2"),
+                    html.Button("Render Full Quality", id="btn-preview-render-full", className="w-full general-element font-bold py-2 rounded-md"),
+                ],
+                className="mb-6"
+            ),
+
+            # Advanced collapsed diagnostics
+            html.Details(
+                [
+                    html.Summary("Developer Diagnostics Panel", className="cursor-pointer font-bold text-sm text-gray-500 p-2"),
+                    html.Div(
+                        [
+                            html.Pre(id="developer-diagnostics-text", className="text-xs text-gray-400 p-2 overflow-auto bg-slate-100 dark:bg-slate-900 general-border")
+                        ]
+                    )
+                ],
+                className="w-full mt-4"
+            ),
+            dcc.Store(id="store-preview-frames-cache", data=[]),
+        ],
+        className="w-full overflow-auto p-4",
+        style={"height": "69vh"},
+    )
+
+
 def make_thresholds_container(thresholds_id: str = C.CTR_THRESHOLDS):
     return html.Div(
         [

@@ -45,6 +45,16 @@ from werkzeug import serving
 
 from .controller import AppState, CompositeMode
 from .camera import Camera
+from .preview import (
+    analyze_scene,
+    plan_motion,
+    render_preview_sequence,
+    PreviewCacheKey,
+    get_preview_cache,
+    set_preview_cache,
+    SceneAnalysis,
+    MotionIntent,
+)
 
 # Globals
 EXPAND_MASK = 5
@@ -157,7 +167,7 @@ app.layout = html.Div(
                 ),
                 components.make_tabs(
                     "main",
-                    ["Mode", "Segmentation", "Inpainting", "Export", "Configuration"],
+                    ["Mode", "Segmentation", "Inpainting", "Preview", "Export", "Configuration"],
                     [
                         html.Div(
                             [
@@ -171,6 +181,7 @@ app.layout = html.Div(
                         ),
                         components.make_slice_generation_container(),
                         components.make_inpainting_container(),
+                        components.make_preview_container(),
                         html.Div(
                             [
                                 components.make_3d_export_div(),
@@ -1816,6 +1827,294 @@ def update_current_tab(classnames):
         if "hidden" not in classname:
             return names[i]
     return no_update
+
+
+# ==============================================================================
+#                      INTERACTIVE PREVIEW CALLBACKS
+# ==============================================================================
+
+@app.callback(
+    Output("store-preview-frames-cache", "data"),
+    Output("preview-frame-slider", "max"),
+    Output("preview-frame-slider", "value", allow_duplicate=True),
+    Output("indicator-depth-quality", "children"),
+    Output("indicator-subject-stability", "children"),
+    Output("indicator-reconstruction-risk", "children"),
+    Output("indicator-motion-safety", "children"),
+    Output("developer-diagnostics-text", "children"),
+    Output("preview-safety-warning", "children"),
+    Output(C.LOGS_DATA, "data", allow_duplicate=True),
+    Output("loading-preview", "children"),
+    Input("btn-generate-preview", "n_clicks"),
+    State("preview-motion-style", "value"),
+    State("preview-motion-strength", "value"),
+    State("preview-quality-dropdown", "value"),
+    State("preview-duration", "value"),
+    State("preview-loop-toggle", "value"),
+    State(C.STORE_APPSTATE_FILENAME, "data"),
+    State(C.LOGS_DATA, "data"),
+    prevent_initial_call=True,
+)
+def generate_preview(n_clicks, style, strength, quality, duration, loop_toggle, filename, logs):
+    if n_clicks is None or filename is None:
+        raise PreventUpdate()
+
+    state = AppState.from_cache(filename)
+    if not state.image_slices or len(state.image_slices) == 0:
+        logs.append("No slices found. Please generate slices first before previewing.")
+        return no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update, logs, ""
+
+    try:
+        # 1. Automated Scene Analysis
+        image_rgb = np.array(state.imgData)
+        depth_map = state.depthMapData
+        if depth_map is None:
+            depth_map = np.ones((image_rgb.shape[0], image_rgb.shape[1]), dtype=np.uint8) * 128
+
+        scene_analysis = analyze_scene(image_rgb, depth_map)
+
+        # 2. Automated Motion Planning
+        loop = "ON" in loop_toggle
+        motion_intent = MotionIntent(style=style, strength=strength, duration=duration, loop=loop)
+        motion_plan = plan_motion(scene_analysis, motion_intent, quality=quality)
+
+        # Compute hash/key for preview cache
+        import hashlib
+        img_hash = hashlib.sha256(image_rgb.tobytes()).hexdigest()[:12]
+        depth_hash = hashlib.sha256(depth_map.tobytes()).hexdigest()[:12]
+        analysis_hash = hashlib.sha256(str(scene_analysis.to_dict()).encode()).hexdigest()[:12]
+
+        cache_key = PreviewCacheKey(
+            image_hash=img_hash,
+            depth_hash=depth_hash,
+            scene_analysis_hash=analysis_hash,
+            motion_style=style,
+            strength=strength,
+            duration=duration,
+            loop=loop,
+            quality=quality,
+        )
+
+        # 3. Check Preview Cache
+        cached_res = get_preview_cache(cache_key)
+        if cached_res is not None:
+            logs.append("Preview cache hit! Loaded frames from cache.")
+            preview_result = cached_res
+            preview_result.cache_hit = True
+        else:
+            logs.append(f"Preview cache miss. Rendering {motion_plan.num_frames} frames at {motion_plan.width}x{motion_plan.height}...")
+            preview_result = render_preview_sequence(state, motion_plan, motion_intent)
+            set_preview_cache(cache_key, preview_result)
+            logs.append("Successfully completed preview rendering and updated cache.")
+
+        # Determine indicators text
+        ind_depth = f"✓ Depth quality: {'Excellent' if scene_analysis.depth_confidence > 0.65 else 'Good' if scene_analysis.depth_confidence > 0.4 else 'Limited'}"
+        ind_subject = f"✓ Subject stability: {'Excellent' if scene_analysis.depth_confidence > 0.55 else 'Good' if scene_analysis.depth_confidence > 0.35 else 'Limited'}"
+        ind_reconstruct = f"✓ Reconstruction risk: {'Low' if scene_analysis.disocclusion_risk < 0.4 else 'Medium' if scene_analysis.disocclusion_risk < 0.7 else 'High'}"
+        ind_safety = f"✓ Motion safety: {scene_analysis.motion_safety}"
+
+        # Developer diagnostics text
+        diag_data = {
+            "Scene": scene_analysis.to_dict(),
+            "Motion Intent": motion_intent.to_dict(),
+            "Calculated Motion Plan": motion_plan.to_dict(),
+            "Cache Hit": preview_result.cache_hit
+        }
+        import json
+        diagnostics_text = json.dumps(diag_data, indent=2)
+
+        safety_warning = "Motion automatically reduced to preserve image quality." if motion_plan.motion_reduced else ""
+
+        max_idx = len(preview_result.frames) - 1
+        return (
+            preview_result.frames,
+            max_idx,
+            0,
+            ind_depth,
+            ind_subject,
+            ind_reconstruct,
+            ind_safety,
+            diagnostics_text,
+            safety_warning,
+            logs,
+            ""
+        )
+    except Exception as e:
+        error_msg = f"Preview could not be generated: {str(e)}"
+        logs.append(error_msg)
+        return no_update, no_update, no_update, "✓ Depth quality: Limited", "✓ Subject stability: Limited", "✓ Reconstruction risk: High", "✓ Motion safety: Limited", f"Preview failed: {str(e)}", "Preview could not be generated.", logs, ""
+
+
+@app.callback(
+    Output("preview-viewport-image", "src"),
+    Output("preview-frame-text", "children"),
+    Input("preview-frame-slider", "value"),
+    State("store-preview-frames-cache", "data"),
+    prevent_initial_call=True,
+)
+def update_preview_viewport(slider_value, frames_cache):
+    if not frames_cache or slider_value is None or slider_value >= len(frames_cache):
+        raise PreventUpdate()
+
+    frame_path = frames_cache[slider_value]
+    frame_text = f"Frame: {slider_value + 1} / {len(frames_cache)}"
+    return frame_path, frame_text
+
+
+@app.callback(
+    Output("preview-frame-slider", "value"),
+    Input("preview-play-interval", "n_intervals"),
+    State("preview-frame-slider", "value"),
+    State("preview-frame-slider", "max"),
+    prevent_initial_call=True,
+)
+def auto_increment_frame(n_intervals, current_value, max_value):
+    if current_value is None or max_value is None or max_value == 0:
+        raise PreventUpdate()
+
+    next_val = current_value + 1
+    if next_val > max_value:
+        next_val = 0
+    return next_val
+
+
+@app.callback(
+    Output("preview-play-interval", "disabled"),
+    Output("preview-frame-slider", "value", allow_duplicate=True),
+    Input("btn-preview-play", "n_clicks"),
+    Input("btn-preview-pause", "n_clicks"),
+    Input("btn-preview-prev", "n_clicks"),
+    Input("btn-preview-next", "n_clicks"),
+    State("preview-frame-slider", "value"),
+    State("preview-frame-slider", "max"),
+    prevent_initial_call=True,
+)
+def handle_playback_buttons(play_clicks, pause_clicks, prev_clicks, next_clicks, current_value, max_value):
+    trigger = ctx.triggered_id
+    if current_value is None or max_value is None or max_value == 0:
+        raise PreventUpdate()
+
+    if trigger == "btn-preview-play":
+        return False, no_update
+    elif trigger == "btn-preview-pause":
+        return True, no_update
+    elif trigger == "btn-preview-prev":
+        prev_val = current_value - 1
+        if prev_val < 0:
+            prev_val = max_value
+        return True, prev_val
+    elif trigger == "btn-preview-next":
+        next_val = current_value + 1
+        if next_val > max_value:
+            next_val = 0
+        return True, next_val
+
+    raise PreventUpdate()
+
+
+@app.callback(
+    Output(C.LOGS_DATA, "data", allow_duplicate=True),
+    Output(C.ANIMATION_OUTPUT, "children", allow_duplicate=True),
+    Output(C.DOWNLOAD_ANIMATION, "data", allow_duplicate=True),
+    Input("btn-preview-render-full", "n_clicks"),
+    State("preview-motion-style", "value"),
+    State("preview-motion-strength", "value"),
+    State("preview-duration", "value"),
+    State("preview-loop-toggle", "value"),
+    State(C.STORE_APPSTATE_FILENAME, "data"),
+    State(C.LOGS_DATA, "data"),
+    running=[(Output("btn-preview-render-full", "disabled"), True, False)],
+    prevent_initial_call=True,
+)
+def render_full_quality_via_preview(n_clicks, style, strength, duration, loop_toggle, filename, logs):
+    if n_clicks is None or filename is None:
+        raise PreventUpdate()
+
+    state = AppState.from_cache(filename)
+    if not state.image_slices or len(state.image_slices) == 0:
+        msg = "No slices found. Please generate slices first before rendering final."
+        logs.append(msg)
+        return logs, msg, no_update
+
+    logs.append("Reuse active SceneAnalysis, planned MotionPlan, and precomputed Depth Representation for Final Quality render.")
+
+    image_rgb = np.array(state.imgData)
+    depth_map = state.depthMapData
+    if depth_map is None:
+        depth_map = np.ones((image_rgb.shape[0], image_rgb.shape[1]), dtype=np.uint8) * 128
+
+    # Recalculate SceneAnalysis and MotionPlan exactly matching the preview's planned motion
+    scene_analysis = analyze_scene(image_rgb, depth_map)
+    loop = "ON" in loop_toggle
+    motion_intent = MotionIntent(style=style, strength=strength, duration=duration, loop=loop)
+    motion_plan = plan_motion(scene_analysis, motion_intent, quality="Quality")
+
+    # Final rendering details
+    camera_distance = state.camera.camera_distance
+    camera_matrix = state.camera_matrix()
+    has_valid_filenames = state.image_slices and all(slice_image.filename is not None for slice_image in state.image_slices)
+
+    margin = 0.1
+    if has_valid_filenames:
+        reconstructed_slices = state.get_reconstructed_slices(margin=margin, use_ai=False)
+        scale_factor = 1.0 + 2.0 * margin
+        card_corners_3d_list = state.get_cards()
+        for card in card_corners_3d_list:
+            card[:, :2] *= scale_factor
+        original_size = (state.imgData.size[1], state.imgData.size[0])
+    else:
+        reconstructed_slices = state.image_slices
+        card_corners_3d_list = state.get_cards()
+        original_size = None
+
+    camera_position = np.array([0, 0, -camera_distance], dtype=np.float32)
+
+    # Use the MotionPlan Low-level parameters strictly to render final production sequence
+    # Production rendering uses 100 frames by default for extreme smoothness
+    logs.append(f"Rendering full-resolution final sequence of 100 frames with planned strengths: Parallax={motion_plan.parallax_strength:.2f}, Zoom={motion_plan.zoom_strength:.2f}, Rotation={motion_plan.rotation_strength:.2f}...")
+
+    render_image_sequence(
+        filename,
+        reconstructed_slices,
+        card_corners_3d_list,
+        camera_matrix,
+        camera_position,
+        push_distance=motion_plan.push_distance,
+        num_frames=100,
+        original_size=original_size,
+        original_slices=state.image_slices,
+        parallax_strength=motion_plan.parallax_strength,
+        camera_motion_strength=motion_plan.camera_motion_strength,
+        zoom_strength=motion_plan.zoom_strength,
+        rotation_strength=motion_plan.rotation_strength,
+    )
+
+    logs.append("Exported 100 frames to animation folder.")
+
+    # Direct MP4 compile
+    from .video_compiler import compile_frames_to_mp4
+    mp4_filename = "animation.mp4"
+    mp4_path = Path(filename) / mp4_filename
+
+    try:
+        compile_frames_to_mp4(
+            frame_dir=Path(filename),
+            output_path=mp4_path,
+            fps=24,
+            width=1920,
+            height=1080,
+            pattern="rendered_image_%03d.png"
+        )
+        logs.append(f"Successfully compiled direct MP4 video at {mp4_path}")
+        msg = "Full Quality final render compiled successfully as MP4!"
+        download_data = dcc.send_file(str(mp4_path))
+    except Exception as e:
+        error_msg = f"Full Quality Video compilation failed: {str(e)}"
+        logs.append(error_msg)
+        msg = f"Error during final render compilation: {str(e)}"
+        download_data = no_update
+
+    return logs, msg, download_data
 
 
 def main():

@@ -416,39 +416,41 @@ def render_view(
     # Z push (zoom) displacement
     scaled_dz = raw_dt[2] * zoom_strength * parallax_strength
 
-    # ZERO-PARALLAX PRISTINE REFERENCE COPY BYPASS
-    if np.abs(pixel_shift_x) < 1e-4 and np.abs(pixel_shift_y) < 1e-4 and np.abs(scaled_dz) < 1e-4:
-        for i, slice_image in enumerate(image_slices):
-            orig_slice = original_slices[i] if original_slices is not None else None
-            if orig_slice is not None:
-                src_img = orig_slice.image
-                if src_img.shape[0] != h_orig or src_img.shape[1] != w_orig:
-                    cur_h, cur_w = src_img.shape[:2]
-                    pad_h = (cur_h - h_orig) // 2
-                    pad_w = (cur_w - w_orig) // 2
-                    src_img = src_img[pad_h:pad_h+h_orig, pad_w:pad_w+w_orig].copy()
+    is_zero_parallax = (
+        np.allclose(pixel_shift_x, 0.0, atol=1e-5)
+        and np.allclose(pixel_shift_y, 0.0, atol=1e-5)
+        and abs(scaled_dz) < 1e-5
+    )
+
+    if is_zero_parallax:
+        slices_to_use = original_slices if original_slices is not None else image_slices
+        for slice_item in slices_to_use:
+            cur_h, cur_w = slice_item.image.shape[:2]
+            pad_h = (cur_h - h_orig) // 2
+            pad_w = (cur_w - w_orig) // 2
+            if original_slices is not None and slice_item.image.shape[0] == h_orig and slice_item.image.shape[1] == w_orig:
+                # original slices are unpadded and match exactly
+                slice_img = slice_item.image
             else:
-                cur_h, cur_w = slice_image.image.shape[:2]
-                pad_h = (cur_h - h_orig) // 2
-                pad_w = (cur_w - w_orig) // 2
-                src_img = slice_image.image[pad_h:pad_h+h_orig, pad_w:pad_w+w_orig].copy()
+                slice_img = slice_item.image[pad_h:pad_h+h_orig, pad_w:pad_w+w_orig]
 
-            alpha_channel = src_img[:, :, 3].astype(np.float32) / 255.0
+            alpha_channel = slice_img[:, :, 3].astype(np.float32) / 255.0
             alpha_expanded = np.expand_dims(alpha_channel, axis=2)
-            rendered_image[:, :, :3] = ((1.0 - alpha_expanded) * rendered_image[:, :, :3] + alpha_expanded * src_img[:, :, :3]).astype(np.uint8)
-            rendered_image[:, :, 3] = np.maximum(rendered_image[:, :, 3], src_img[:, :, 3])
+            rendered_image[:, :, :3] = ((1.0 - alpha_expanded) * rendered_image[:, :, :3] + alpha_expanded * slice_img[:, :, :3]).astype(np.uint8)
+            rendered_image[:, :, 3] = np.maximum(rendered_image[:, :, 3], slice_img[:, :, 3])
 
-            # Since shift is exactly 0, all visible layer pixels are 100% ORIGINAL_SOURCE
-            provenance_map[src_img[:, :, 3] > 10] = 1
+        provenance_map = np.where(rendered_image[:, :, 3] > 10, 1, 0).astype(np.uint8)
+        disocclusion_mask = np.zeros((h_orig, w_orig), dtype=np.uint8)
 
         final_output = RenderedImage(
             rendered_image,
-            reconstruction_mask=np.zeros((h_orig, w_orig), dtype=np.uint8),
+            reconstruction_mask=disocclusion_mask,
             reconstruction_ratio=0.0,
             warnings=warnings,
             provenance_map=provenance_map,
             ai_used=False
         )
+
         final_output.requested_camera_displacement = 0.0
         final_output.actual_camera_displacement = 0.0
         final_output.normalized_parallax_strength = float(parallax_strength)
@@ -463,12 +465,14 @@ def render_view(
         final_output.screen_space_middleground_disp_px = 0.0
         final_output.screen_space_background_disp_px = 0.0
         final_output.screen_space_max_disparity_px = 0.0
+
         final_output.reference_fidelity_score = 100.0
-        final_output.original_pixel_percentage = 100.0
+        final_output.original_pixel_percentage = float(np.count_nonzero(provenance_map == 1)) / float(h_orig * w_orig) * 100.0
         final_output.depth_warped_percentage = 0.0
         final_output.reconstructed_reference_percentage = 0.0
         final_output.temporary_edge_fill_percentage = 0.0
         final_output.recursively_reconstructed_percentage = 0.0
+
         return final_output
 
     # Calculate relative translations
@@ -566,32 +570,15 @@ def render_view(
         else:
             src_img = slice_image.image[pad_h:pad_h+h_orig, pad_w:pad_w+w_orig].copy()
 
-        # Compute segmentation domain for this layer in reference space
-        if i == 0:
-            layer_mask = (depth_map >= 0) & (depth_map <= slice_depths[0])
-        else:
-            layer_mask = (depth_map > slice_depths[i-1]) & (depth_map <= slice_depths[i])
-
-        # Remap coordinates for the current layer
-        map_x = base_map_x - shift_x
-        map_y = base_map_y - shift_y
-
-        # Source pixel preservation: copy direct original pixels if shift is negligible
-        small_shift_mask = (np.abs(shift_x) < 0.05) & (np.abs(shift_y) < 0.05)
-        map_x[small_shift_mask] = grid_x[small_shift_mask]
-        map_y[small_shift_mask] = grid_y[small_shift_mask]
-
-        # Warp the layer segmentation domain and edge protection into target coordinate space using Nearest Neighbor
-        warped_layer_mask_uint8 = cv2.remap(layer_mask.astype(np.uint8) * 255, map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        warped_layer_mask = warped_layer_mask_uint8 > 127
-
-        warped_dilated_edges_uint8 = cv2.remap(dilated_edges.astype(np.uint8) * 255, map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        warped_dilated_edges = warped_dilated_edges_uint8 > 127
-
-        # Remap unpadded original reference image
-        warped_orig = cv2.remap(src_img, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0,0))
-        # Keep original reference pixels completely crisp and unaltered where shift is negligible!
-        warped_orig[small_shift_mask] = src_img[small_shift_mask]
+        # Check if layer is static (such as the visual anchor middleground layer)
+        scale_factor_i = Z_clamped[i] / (Z_clamped[i] - dz_layers[i]) if (Z_clamped[i] - dz_layers[i]) > 0 else 1.0
+        is_layer_static = (
+            abs(dx_layers[i]) < 0.05
+            and abs(dy_layers[i]) < 0.05
+            and abs(scale_factor_i - 1.0) < 1e-4
+            and abs(yaw) < 0.01
+            and abs(pitch) < 0.01
+        )
 
         if is_layer_static:
             warped_orig = src_img
@@ -609,16 +596,11 @@ def render_view(
             H_unpadded_i = cv2.getPerspectiveTransform(unpadded_src_corners, corners_2d_cin_unpadded)
             warped_orig = cv2.warpPerspective(src_img, H_unpadded_i, (w_orig, h_orig), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0,0))
 
-        # Occlusion-aware compositing inside target-space layer's domain
-        layer_unpadded_active = (warped_orig[:, :, 3] > 10) & warped_layer_mask
-        layer_padded_active = (warped_padded[:, :, 3] > 10) & warped_layer_mask
+        # Occlusion-aware compositing inside layer's domain
+        layer_unpadded_active = (warped_orig[:, :, 3] > 10)
+        layer_padded_active = (warped_padded[:, :, 3] > 10)
 
-        # Apply edge protection mask to avoid bleeding near depth discontinuities in target space
-        if i > 0:
-            layer_unpadded_active = layer_unpadded_active & (~warped_dilated_edges)
-            layer_padded_active = layer_padded_active & (~warped_dilated_edges)
-
-        # Vectorized C-level composition via np.where to eliminate slow python-level indirect indexing
+        # Vectorized C-level composition via np.where
         layer_composite = np.zeros((h_orig, w_orig, 4), dtype=np.uint8)
         for c in range(4):
             layer_composite[:, :, c] = np.where(layer_unpadded_active, warped_orig[:, :, c],
@@ -691,14 +673,13 @@ def render_view(
     final_output.screen_space_background_disp_px = disp_layers_px[0] if len(disp_layers_px) > 0 else 0.0
     final_output.screen_space_max_disparity_px = max_disparity_px
 
-    # Compute image-fidelity metrics (all mutually exclusive categories must sum to exactly 100.0%)
+    # Compute image-fidelity metrics
     total_viewport_pixels = float(h_orig * w_orig)
     original_pixel_percentage = float(np.count_nonzero(provenance_map == 1)) / total_viewport_pixels * 100.0
     depth_warped_percentage = float(np.count_nonzero(provenance_map == 2)) / total_viewport_pixels * 100.0
     reconstructed_reference_percentage = float(np.count_nonzero(provenance_map == 3)) / total_viewport_pixels * 100.0
     temporary_edge_fill_percentage = float(np.count_nonzero(provenance_map == 4)) / total_viewport_pixels * 100.0
     recursively_reconstructed_percentage = 0.0
-    unknown_percentage = float(np.count_nonzero(provenance_map == 0)) / total_viewport_pixels * 100.0
 
     # reference_fidelity_score is the percentage of visible frame pixels directly traceable to original reference
     reference_fidelity_score = original_pixel_percentage + depth_warped_percentage
@@ -710,7 +691,6 @@ def render_view(
     final_output.reconstructed_reference_percentage = reconstructed_reference_percentage
     final_output.temporary_edge_fill_percentage = temporary_edge_fill_percentage
     final_output.recursively_reconstructed_percentage = recursively_reconstructed_percentage
-    final_output.unknown_percentage = unknown_percentage
 
     return final_output
 
