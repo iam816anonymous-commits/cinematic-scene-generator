@@ -512,12 +512,12 @@ def render_view(
 
     disparity_map_normalized = (depth_map - depth_min) / depth_range
     disparity_anchor_normalized = (float(image_slices[anchor_idx].depth) - depth_min) / depth_range
-    disparity_rel = disparity_map_normalized - disparity_anchor_normalized
+    disparity_rel = (disparity_map_normalized - disparity_anchor_normalized).astype(np.float32)
 
     # Continuous perspective projection matching Z scaling (Z_pix distance from camera)
     z_pix = 500.0 * ((255.0 - depth_map) / 255.0)
     Z_pix = z_pix - start_camera_position[2]
-    scale_factor = np.where(np.abs(Z_pix - scaled_dz) > 1e-3, Z_pix / (Z_pix - scaled_dz), 1.0)
+    scale_factor = np.where(np.abs(Z_pix - scaled_dz) > 1e-3, Z_pix / (Z_pix - scaled_dz), 1.0).astype(np.float32)
 
     # Edge protection based on depth discontinuities
     depth_grad = cv2.Laplacian(depth_map, cv2.CV_32F)
@@ -527,6 +527,17 @@ def render_view(
 
     # Layer sorted depths
     slice_depths = sorted([float(s.depth) for s in image_slices])
+
+    # Precalculate static grid of coordinates once per frame
+    grid_x, grid_y = np.meshgrid(np.arange(w_orig, dtype=np.float32), np.arange(h_orig, dtype=np.float32))
+
+    # Precalculate remapping base coordinates to avoid redundant additions
+    base_map_x = (grid_x - w_orig/2) * scale_factor + w_orig/2
+    base_map_y = (grid_y - h_orig/2) * scale_factor + h_orig/2
+
+    # Dense disparity-driven backward remapping coordinates
+    shift_x = (pixel_shift_x * disparity_rel).astype(np.float32)
+    shift_y = (pixel_shift_y * disparity_rel).astype(np.float32)
 
     # Temporary variable to compute background disocclusion ratio
     disocclusion_ratio = 0.0
@@ -552,14 +563,9 @@ def render_view(
         else:
             layer_mask = (depth_map > slice_depths[i-1]) & (depth_map <= slice_depths[i])
 
-        # Grid of original coordinates
-        grid_x, grid_y = np.meshgrid(np.arange(w_orig, dtype=np.float32), np.arange(h_orig, dtype=np.float32))
-
-        # Dense disparity-driven backward remapping coordinates
-        shift_x = pixel_shift_x * disparity_rel
-        shift_y = pixel_shift_y * disparity_rel
-        map_x = (grid_x - w_orig/2) * scale_factor + w_orig/2 - shift_x
-        map_y = (grid_y - h_orig/2) * scale_factor + h_orig/2 - shift_y
+        # Remap coordinates for the current layer
+        map_x = base_map_x - shift_x
+        map_y = base_map_y - shift_y
 
         # Source pixel preservation: copy direct original pixels if shift is negligible
         small_shift_mask = (np.abs(shift_x) < 0.05) & (np.abs(shift_y) < 0.05)
@@ -567,12 +573,12 @@ def render_view(
         map_y[small_shift_mask] = grid_y[small_shift_mask]
 
         # Remap unpadded original reference image
-        warped_orig = cv2.remap(src_img, map_x.astype(np.float32), map_y.astype(np.float32), cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0,0))
+        warped_orig = cv2.remap(src_img, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0,0))
 
         # Reference-based disocclusion: remap from precomputed padded reference slice
         map_x_padded = map_x + pad_w
         map_y_padded = map_y + pad_h
-        warped_padded = cv2.remap(slice_image.image, map_x_padded.astype(np.float32), map_y_padded.astype(np.float32), cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0,0))
+        warped_padded = cv2.remap(slice_image.image, map_x_padded, map_y_padded, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0,0))
 
         # Occlusion-aware compositing inside layer's domain
         layer_unpadded_active = (warped_orig[:, :, 3] > 10) & layer_mask
@@ -583,30 +589,26 @@ def render_view(
             layer_unpadded_active = layer_unpadded_active & (~dilated_edges)
             layer_padded_active = layer_padded_active & (~dilated_edges)
 
-        # Composite unpadded original first, fallback to padded reference for disoccluded holes
-        layer_composite = np.zeros_like(rendered_image)
-        layer_provenance = np.zeros_like(provenance_map)
+        # Vectorized C-level composition via np.where to eliminate slow python-level indirect indexing
+        layer_composite = np.zeros((h_orig, w_orig, 4), dtype=np.uint8)
+        for c in range(4):
+            layer_composite[:, :, c] = np.where(layer_unpadded_active, warped_orig[:, :, c],
+                                                np.where(layer_padded_active, warped_padded[:, :, c], 0))
 
-        # 1. Reconstructed reference disocclusion pixels
-        layer_composite[layer_padded_active] = warped_padded[layer_padded_active]
-        layer_provenance[layer_padded_active] = 3  # RECONSTRUCTED_REFERENCE
-
-        # 2. Depth-warped pixels
-        layer_composite[layer_unpadded_active] = warped_orig[layer_unpadded_active]
-        layer_provenance[layer_unpadded_active] = 2  # DEPTH_WARPED
-
-        # 3. Pristine original pixels
         layer_orig_pristine = layer_unpadded_active & small_shift_mask
-        layer_provenance[layer_orig_pristine] = 1  # ORIGINAL
+        layer_provenance = np.zeros((h_orig, w_orig), dtype=np.uint8)
+        layer_provenance = np.where(layer_padded_active, 3, layer_provenance)
+        layer_provenance = np.where(layer_unpadded_active, 2, layer_provenance)
+        layer_provenance = np.where(layer_orig_pristine, 1, layer_provenance)
 
-        # Blend layer over the composited frame using alpha blending (Back-to-Front)
-        alpha_channel = layer_composite[:, :, 3] / 255.0
-        for c in range(3):
-            rendered_image[:, :, c] = (1.0 - alpha_channel) * rendered_image[:, :, c] + alpha_channel * layer_composite[:, :, c]
+        # Vectorized alpha blending across all channels
+        alpha_channel = layer_composite[:, :, 3].astype(np.float32) / 255.0
+        alpha_expanded = np.expand_dims(alpha_channel, axis=2)
+        rendered_image[:, :, :3] = ((1.0 - alpha_expanded) * rendered_image[:, :, :3] + alpha_expanded * layer_composite[:, :, :3]).astype(np.uint8)
         rendered_image[:, :, 3] = np.maximum(rendered_image[:, :, 3], layer_composite[:, :, 3])
 
-        # Write layer provenance to the main provenance map
-        provenance_map[layer_provenance > 0] = layer_provenance[layer_provenance > 0]
+        # Write layer provenance to the main provenance map using vectorized np.where
+        provenance_map = np.where(layer_provenance > 0, layer_provenance, provenance_map)
 
         # Calculate disocclusion ratio of background layer for warning reporting
         if i == 0:
