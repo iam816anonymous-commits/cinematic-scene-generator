@@ -157,7 +157,7 @@ app.layout = html.Div(
                 ),
                 components.make_tabs(
                     "main",
-                    ["Mode", "Segmentation", "Inpainting", "Export", "Configuration"],
+                    ["Mode", "Segmentation", "Inpainting", "Preview", "Export", "Configuration"],
                     [
                         html.Div(
                             [
@@ -171,6 +171,7 @@ app.layout = html.Div(
                         ),
                         components.make_slice_generation_container(),
                         components.make_inpainting_container(),
+                        components.make_preview_container(),
                         html.Div(
                             [
                                 components.make_3d_export_div(),
@@ -201,6 +202,7 @@ components.make_canvas_callbacks(app)
 components.make_navigation_callbacks(app)
 components.make_inpainting_container_callbacks(app)
 components.make_configuration_callbacks(app)
+components.make_preview_callbacks(app)
 
 
 # Callbacks for collapsible sections
@@ -1810,7 +1812,7 @@ def save_state(n_clicks, filename, logs):
     prevent_initial_call=True,
 )
 def update_current_tab(classnames):
-    names = ["Mode", "Segmentation", "Inpainting", "Export", "Configuration"]
+    names = ["Mode", "Segmentation", "Inpainting", "Preview", "Export", "Configuration"]
     for i, classname in enumerate(classnames):
         if "hidden" not in classname:
             return names[i]

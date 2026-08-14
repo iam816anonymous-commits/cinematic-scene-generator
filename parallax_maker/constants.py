@@ -143,3 +143,18 @@ STORE_CURRENT_TAB = "current-tab"
 
 CHECKLIST_DOF = "toggle-dof-support"
 CHECKLIST_REGION_OF_INTEREST = "toggle-region-of-interest"
+
+# Preview Constants
+DROPDOWN_PREVIEW_MOVEMENT = "preview-movement-dropdown"
+DROPDOWN_PREVIEW_STRENGTH = "preview-strength-dropdown"
+DROPDOWN_PREVIEW_MOTION = "preview-motion-dropdown"
+DROPDOWN_PREVIEW_DURATION = "preview-duration-dropdown"
+RADIO_PREVIEW_LOOP = "preview-loop-radio"
+DROPDOWN_PREVIEW_QUALITY = "preview-quality-dropdown"
+BTN_PREVIEW_GENERATE = "preview-generate-button"
+BTN_PREVIEW_RENDER_FINAL = "preview-render-final-button"
+VIDEO_PREVIEW_PLAYER = "preview-video-player"
+SLIDER_PREVIEW_SCRUBBER = "preview-timeline-scrubber"
+DIV_PREVIEW_DIAGNOSTICS = "preview-diagnostics-div"
+DIV_PREVIEW_QUALITY_INDICATORS = "preview-quality-indicators-div"
+DIV_PREVIEW_SAFETY_MSG = "preview-safety-msg-div"
