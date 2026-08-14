@@ -1559,6 +1559,7 @@ def export_animation(n_clicks, filename, num_frames, logs):
         push_distance=camera_distance * 0.75,  # XXX - make configurable
         num_frames=num_frames,
         original_size=original_size,
+        original_slices=state.image_slices,
     )
 
     logs.append(f"Exported {num_frames} frames to animation")
