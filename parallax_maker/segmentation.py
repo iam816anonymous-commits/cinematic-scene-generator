@@ -298,6 +298,7 @@ def render_view(
     start_camera_position=None,
     perceptual_parallax_strength=0.55,
     t=0.0,
+    depth_map=None,
 ):
     """
     Render the current view of the camera with precise coordinate, reconstruction, and provenance tracking.
@@ -484,242 +485,142 @@ def render_view(
         card_final = card_rot + np.array([0, 0, z_anchor], dtype=np.float32)
         cinematic_cards.append(card_final)
 
-    # Coordinate Correctness: Compute original unpadded card geometry to prevent coordinate scaling mismatch
-    if cur_w > w_orig:
-        margin = (cur_w - w_orig) / (2.0 * w_orig)
-        scale_factor = 1.0 + 2.0 * margin
-        bg_orig_card = card_corners_3d_list[0].copy()
-        bg_orig_card[:, :2] /= scale_factor
-    else:
-        bg_orig_card = card_corners_3d_list[0]
+    # Reconstruct continuous depth map from slices if not passed
+    if depth_map is None:
+        depth_map = np.zeros((h_orig, w_orig), dtype=np.uint8)
+        for i, slice_image in enumerate(image_slices):
+            cur_h, cur_w = slice_image.image.shape[:2]
+            if cur_h == h_orig and cur_w == w_orig:
+                alpha = slice_image.image[:, :, 3]
+            else:
+                alpha = slice_image.image[
+                    (cur_h - h_orig)//2 : (cur_h - h_orig)//2 + h_orig,
+                    (cur_w - w_orig)//2 : (cur_w - w_orig)//2 + w_orig,
+                    3
+                ]
+            depth_map[alpha > 10] = int(slice_image.depth)
 
-    # Transform bg_orig_card using background layer index 0
-    bg_orig_trans = bg_orig_card.copy()
-    bg_orig_trans[:, 0] += dx_layers[0]
-    bg_orig_trans[:, 1] += dy_layers[0]
-    bg_orig_trans[:, 2] = Z_clamped[0] + start_camera_position[2]
+    # Disparity map and visual anchor value
+    disparity_map = depth_map.astype(np.float32) / 255.0
+    disparity_anchor_val = float(image_slices[anchor_idx].depth) / 255.0
 
-    bg_orig_rel = bg_orig_trans - np.array([0, 0, z_anchor], dtype=np.float32)
-    bg_orig_rot = bg_orig_rel @ R.T
-    bg_orig_final = bg_orig_rot + np.array([0, 0, z_anchor], dtype=np.float32)
+    # Normalize disparity map relative to actual segmented active depth range to preserve exact 1:1 screen pixel disparity scale
+    depth_depths = [float(s.depth) for s in image_slices]
+    depth_min = min(depth_depths) if depth_depths else 0.0
+    depth_max = max(depth_depths) if depth_depths else 255.0
+    depth_range = max(1.0, depth_max - depth_min)
 
-    # Project original background slice to estimate disocclusion ratio
-    rvec_orbit = np.zeros((3, 1), dtype=np.float32)
-    tvec_orbit = -start_camera_position.reshape(3, 1)
-    card_corners_2d_orig, _ = cv2.projectPoints(
-        bg_orig_final, rvec_orbit, tvec_orbit, camera_matrix, None
-    )
-    card_corners_2d_orig = np.int32(card_corners_2d_orig.reshape(-1, 2))
+    disparity_map_normalized = (depth_map - depth_min) / depth_range
+    disparity_anchor_normalized = (float(image_slices[anchor_idx].depth) - depth_min) / depth_range
+    disparity_rel = (disparity_map_normalized - disparity_anchor_normalized).astype(np.float32)
 
-    M_orig = cv2.getPerspectiveTransform(
-        np.float32([
-            [0, 0],
-            [w_orig, 0],
-            [w_orig, h_orig],
-            [0, h_orig]
-        ]),
-        np.float32(card_corners_2d_orig)
-    )
+    # Continuous perspective projection matching Z scaling (Z_pix distance from camera)
+    z_pix = 500.0 * ((255.0 - depth_map) / 255.0)
+    Z_pix = z_pix - start_camera_position[2]
+    scale_factor = np.where(np.abs(Z_pix - scaled_dz) > 1e-3, Z_pix / (Z_pix - scaled_dz), 1.0).astype(np.float32)
 
-    # Load unpadded original background slice
-    if bg_orig_slice is not None:
-        bg_orig_img = bg_orig_slice.image
-    else:
-        # Fallback: crop the reconstructed background
-        bg_orig_img = bg_slice.image[
-            (cur_h - h_orig)//2 : (cur_h - h_orig)//2 + h_orig,
-            (cur_w - w_orig)//2 : (cur_w - w_orig)//2 + w_orig
-        ].copy()
+    # Edge protection based on depth discontinuities
+    depth_grad = cv2.Laplacian(depth_map, cv2.CV_32F)
+    edge_discontinuity = np.abs(depth_grad) > 15
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    dilated_edges = cv2.dilate(edge_discontinuity.astype(np.uint8), kernel, iterations=1)
 
-    # Warp unpadded original background alpha channel to measure disocclusion area
-    warped_bg_orig_alpha = cv2.warpPerspective(
-        bg_orig_img[:, :, 3],
-        M_orig,
-        (w_orig, h_orig)
-    )
+    # Layer sorted depths
+    slice_depths = sorted([float(s.depth) for s in image_slices])
 
-    disocclusion_hole_mask = cv2.inRange(warped_bg_orig_alpha, 0, 254)
-    disocclusion_pixels = cv2.countNonZero(disocclusion_hole_mask)
-    disocclusion_ratio = float(disocclusion_pixels) / float(h_orig * w_orig)
+    # Precalculate static grid of coordinates once per frame
+    grid_x, grid_y = np.meshgrid(np.arange(w_orig, dtype=np.float32), np.arange(h_orig, dtype=np.float32))
 
-    use_ai_inpainting = disocclusion_ratio > ai_threshold_ratio
+    # Precalculate remapping base coordinates to avoid redundant additions
+    base_map_x = (grid_x - w_orig/2) * scale_factor + w_orig/2
+    base_map_y = (grid_y - h_orig/2) * scale_factor + h_orig/2
 
-    if use_ai_inpainting:
-        ai_used = True
-        # AI Mode: use precomputed stable AI-inpainted background slice
-        card_corners_2d_padded, _ = cv2.projectPoints(
-            cinematic_cards[0], rvec_orbit, tvec_orbit, camera_matrix, None
-        )
-        card_corners_2d_padded = np.int32(card_corners_2d_padded.reshape(-1, 2))
+    # Dense disparity-driven backward remapping coordinates
+    shift_x = (pixel_shift_x * disparity_rel).astype(np.float32)
+    shift_y = (pixel_shift_y * disparity_rel).astype(np.float32)
 
-        M_padded = cv2.getPerspectiveTransform(
-            np.float32([
-                [0, 0],
-                [cur_w, 0],
-                [cur_w, cur_h],
-                [0, cur_h]
-            ]),
-            np.float32(card_corners_2d_padded)
-        )
+    # Temporary variable to compute background disocclusion ratio
+    disocclusion_ratio = 0.0
 
-        warped_slice = cv2.warpPerspective(
-            bg_slice.image,
-            M_padded,
-            (w_orig, h_orig)
-        )
-
-        # Dynamic inpainting ONLY handles newly exposed viewport-edge regions not covered by precomputed padded slice
-        edge_hole_mask = cv2.inRange(warped_slice[:, :, 3], 0, 254)
-        edge_hole_pixels = cv2.countNonZero(edge_hole_mask)
-
-        if edge_hole_pixels > 0:
-            inpainted_rgb = cv2.inpaint(
-                warped_slice[:, :, :3],
-                edge_hole_mask,
-                inpaintRadius=3,
-                flags=cv2.INPAINT_TELEA
-            )
-            warped_slice[:, :, :3] = inpainted_rgb
-            warped_slice[:, :, 3] = 255
-
-        rendered_image = warped_slice
-
-        # Track pixel provenance
-        provenance_map[warped_bg_orig_alpha > 10] = 1 # original/depth-warped
-        provenance_map[(warped_bg_orig_alpha <= 10) & (warped_slice[:, :, 3] > 0)] = 3 # precomputed stable AI
-        if edge_hole_pixels > 0:
-            provenance_map[edge_hole_mask > 0] = 2 # dynamic deterministic edge inpaint
-
-    else:
-        # Deterministic Mode: warp stable original background and dynamically inpaint holes
-        warped_bg_orig = cv2.warpPerspective(
-            bg_orig_img,
-            M_orig,
-            (w_orig, h_orig)
-        )
-
-        hole_mask = cv2.inRange(warped_bg_orig[:, :, 3], 0, 254)
-        hole_pixels = cv2.countNonZero(hole_mask)
-
-        if hole_pixels > 0:
-            inpainted_rgb = cv2.inpaint(
-                warped_bg_orig[:, :, :3],
-                hole_mask,
-                inpaintRadius=3,
-                flags=cv2.INPAINT_TELEA
-            )
-            warped_bg_orig[:, :, :3] = inpainted_rgb
-            warped_bg_orig[:, :, 3] = 255
-
-        rendered_image = warped_bg_orig
-
-        # Track pixel provenance
-        provenance_map[warped_bg_orig_alpha > 10] = 1 # original/depth-warped
-        if hole_pixels > 0:
-            provenance_map[hole_mask > 0] = 2 # deterministic OpenCV Telea
-
-    # Track if disocclusion ratio exceeds max ratio limit
-    if disocclusion_ratio > max_reconstruction_ratio:
-        warnings.append(
-            f"Requested camera displacement creates a disocclusion area of {disocclusion_ratio * 100:.2f}%, "
-            f"which exceeds the maximum recommended ratio of {max_reconstruction_ratio * 100:.2f}%."
-        )
-
-    # Render middle and foreground layers (from back to front)
-    for i in range(1, len(image_slices)):
+    # Reference-View / Image-Based View Synthesis Warp (Back to Front)
+    for i in range(len(image_slices)):
         slice_image = image_slices[i]
         orig_slice = original_slices[i] if original_slices is not None else None
 
         cur_h, cur_w = slice_image.image.shape[:2]
+        pad_h = (cur_h - h_orig) // 2
+        pad_w = (cur_w - w_orig) // 2
 
-        # Coordinate Correctness: Compute original unpadded card geometry
-        if cur_w > w_orig:
-            margin = (cur_w - w_orig) / (2.0 * w_orig)
-            scale_factor = 1.0 + 2.0 * margin
-            orig_card = card_corners_3d_list[i].copy()
-            orig_card[:, :2] /= scale_factor
-        else:
-            orig_card = card_corners_3d_list[i]
-
-        # Translate orig_card based on layer index i
-        orig_card_trans = orig_card.copy()
-        orig_card_trans[:, 0] += dx_layers[i]
-        orig_card_trans[:, 1] += dy_layers[i]
-        orig_card_trans[:, 2] = Z_clamped[i] + start_camera_position[2]
-
-        orig_card_rel = orig_card_trans - np.array([0, 0, z_anchor], dtype=np.float32)
-        orig_card_rot = orig_card_rel @ R.T
-        orig_card_final = orig_card_rot + np.array([0, 0, z_anchor], dtype=np.float32)
-
-        card_corners_2d, _ = cv2.projectPoints(
-            orig_card_final, rvec_orbit, tvec_orbit, camera_matrix, None
-        )
-        card_corners_2d = np.int32(card_corners_2d.reshape(-1, 2))
-
-        M = cv2.getPerspectiveTransform(
-            np.float32([
-                [0, 0],
-                [w_orig, 0],
-                [w_orig, h_orig],
-                [0, h_orig]
-            ]),
-            np.float32(card_corners_2d)
-        )
-
-        # Load unpadded original slice image
+        # Get original reference unpadded image
         if orig_slice is not None:
-            fg_img = orig_slice.image
+            src_img = orig_slice.image
         else:
-            fg_img = slice_image.image[
-                (cur_h - h_orig)//2 : (cur_h - h_orig)//2 + h_orig,
-                (cur_w - w_orig)//2 : (cur_w - w_orig)//2 + w_orig
-            ].copy()
+            src_img = slice_image.image[pad_h:pad_h+h_orig, pad_w:pad_w+w_orig].copy()
 
-        warped_slice = cv2.warpPerspective(
-            fg_img,
-            M,
-            (w_orig, h_orig),
-        )
+        # Compute segmentation domain for this layer
+        if i == 0:
+            layer_mask = (depth_map >= 0) & (depth_map <= slice_depths[0])
+        else:
+            layer_mask = (depth_map > slice_depths[i-1]) & (depth_map <= slice_depths[i])
 
-        # Check for cached mask in local cache
-        cache = recon_mask_cache if recon_mask_cache is not None else {}
-        cache_key = (id(slice_image), h_orig, w_orig)
-        recon_mask = cache.get(cache_key)
-        if recon_mask is None:
-            recon_mask = get_slice_reconstruction_mask(
-                slice_image.image,
-                orig_slice.image if orig_slice else None,
-                h_orig,
-                w_orig
-            )
-            cache[cache_key] = recon_mask
+        # Remap coordinates for the current layer
+        map_x = base_map_x - shift_x
+        map_y = base_map_y - shift_y
 
-        # Warp the reconstruction mask using linear interpolation to allow smooth/anti-aliased boundaries
-        warped_recon_mask = cv2.warpPerspective(
-            recon_mask,
-            M,
-            (w_orig, h_orig),
-            flags=cv2.INTER_LINEAR,
-        )
+        # Source pixel preservation: copy direct original pixels if shift is negligible
+        small_shift_mask = (np.abs(shift_x) < 0.05) & (np.abs(shift_y) < 0.05)
+        map_x[small_shift_mask] = grid_x[small_shift_mask]
+        map_y[small_shift_mask] = grid_y[small_shift_mask]
 
-        # Alpha Compositing of the warped slice with the rendered image
-        alpha = warped_slice[:, :, 3] / 255.0
-        blend_with_alpha(rendered_image, warped_slice)
+        # Remap unpadded original reference image
+        warped_orig = cv2.remap(src_img, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0,0))
 
-        # Update pixel provenance map for foreground pixels (alpha > 0.5)
-        fg_covered = alpha > 0.5
-        fg_recon = fg_covered & (warped_recon_mask > 127)
-        fg_orig = fg_covered & (warped_recon_mask <= 127)
+        # Reference-based disocclusion: remap from precomputed padded reference slice
+        map_x_padded = map_x + pad_w
+        map_y_padded = map_y + pad_h
+        warped_padded = cv2.remap(slice_image.image, map_x_padded, map_y_padded, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0,0,0,0))
 
-        provenance_map[fg_recon] = 2 # deterministic reconstructed foreground edges
-        provenance_map[fg_orig] = 1  # original depth-warped foreground
+        # Occlusion-aware compositing inside layer's domain
+        layer_unpadded_active = (warped_orig[:, :, 3] > 10) & layer_mask
+        layer_padded_active = (warped_padded[:, :, 3] > 10) & layer_mask
+
+        # Apply edge protection mask to avoid bleeding near depth discontinuities
+        if i > 0:
+            layer_unpadded_active = layer_unpadded_active & (~dilated_edges)
+            layer_padded_active = layer_padded_active & (~dilated_edges)
+
+        # Vectorized C-level composition via np.where to eliminate slow python-level indirect indexing
+        layer_composite = np.zeros((h_orig, w_orig, 4), dtype=np.uint8)
+        for c in range(4):
+            layer_composite[:, :, c] = np.where(layer_unpadded_active, warped_orig[:, :, c],
+                                                np.where(layer_padded_active, warped_padded[:, :, c], 0))
+
+        layer_orig_pristine = layer_unpadded_active & small_shift_mask
+        layer_provenance = np.zeros((h_orig, w_orig), dtype=np.uint8)
+        layer_provenance = np.where(layer_padded_active, 3, layer_provenance)
+        layer_provenance = np.where(layer_unpadded_active, 2, layer_provenance)
+        layer_provenance = np.where(layer_orig_pristine, 1, layer_provenance)
+
+        # Vectorized alpha blending across all channels
+        alpha_channel = layer_composite[:, :, 3].astype(np.float32) / 255.0
+        alpha_expanded = np.expand_dims(alpha_channel, axis=2)
+        rendered_image[:, :, :3] = ((1.0 - alpha_expanded) * rendered_image[:, :, :3] + alpha_expanded * layer_composite[:, :, :3]).astype(np.uint8)
+        rendered_image[:, :, 3] = np.maximum(rendered_image[:, :, 3], layer_composite[:, :, 3])
+
+        # Write layer provenance to the main provenance map using vectorized np.where
+        provenance_map = np.where(layer_provenance > 0, layer_provenance, provenance_map)
+
+        # Calculate disocclusion ratio of background layer for warning reporting
+        if i == 0:
+            disocclusion_hole_mask = cv2.inRange(warped_orig[:, :, 3], 0, 10)
+            disocclusion_ratio = float(cv2.countNonZero(disocclusion_hole_mask)) / float(h_orig * w_orig)
 
     # Compute final reconstructed-pixel ratio strictly AFTER compositing
-    reconstructed_pixels = np.count_nonzero((provenance_map == 2) | (provenance_map == 3))
+    reconstructed_pixels = np.count_nonzero((provenance_map == 3) | (provenance_map == 4))
     reconstruction_ratio = float(reconstructed_pixels) / float(h_orig * w_orig)
 
     # Disocclusion mask (all reconstructed pixels)
-    disocclusion_mask = ((provenance_map == 2) | (provenance_map == 3)).astype(np.uint8) * 255
+    disocclusion_mask = ((provenance_map == 3) | (provenance_map == 4)).astype(np.uint8) * 255
 
     # Wrap as RenderedImage to attach tracking metadata attributes cleanly
     final_output = RenderedImage(
@@ -775,6 +676,25 @@ def render_view(
     final_output.screen_space_middleground_disp_px = disp_layers_px[anchor_idx] if len(disp_layers_px) > 0 else 0.0
     final_output.screen_space_background_disp_px = disp_layers_px[0] if len(disp_layers_px) > 0 else 0.0
     final_output.screen_space_max_disparity_px = max_disparity_px
+
+    # Compute image-fidelity metrics
+    total_viewport_pixels = float(h_orig * w_orig)
+    original_pixel_percentage = float(np.count_nonzero(provenance_map == 1)) / total_viewport_pixels * 100.0
+    depth_warped_percentage = float(np.count_nonzero(provenance_map == 2)) / total_viewport_pixels * 100.0
+    reconstructed_reference_percentage = float(np.count_nonzero(provenance_map == 3)) / total_viewport_pixels * 100.0
+    temporary_edge_fill_percentage = float(np.count_nonzero(provenance_map == 4)) / total_viewport_pixels * 100.0
+    recursively_reconstructed_percentage = 0.0
+
+    # reference_fidelity_score is the percentage of visible frame pixels directly traceable to original reference
+    reference_fidelity_score = original_pixel_percentage + depth_warped_percentage
+
+    # Attach image-fidelity metrics
+    final_output.reference_fidelity_score = reference_fidelity_score
+    final_output.original_pixel_percentage = original_pixel_percentage
+    final_output.depth_warped_percentage = depth_warped_percentage
+    final_output.reconstructed_reference_percentage = reconstructed_reference_percentage
+    final_output.temporary_edge_fill_percentage = temporary_edge_fill_percentage
+    final_output.recursively_reconstructed_percentage = recursively_reconstructed_percentage
 
     return final_output
 
